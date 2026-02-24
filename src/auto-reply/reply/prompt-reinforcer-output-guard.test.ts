@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import { makeTempWorkspace } from "../../test-helpers/workspace.js";
@@ -123,6 +125,32 @@ describe("prompt-reinforcer output guard", () => {
     });
     expect(calls).toBe(10);
     expect(payloads[0]?.text).toBe("策略冲突，已拦截。");
+  });
+
+  it("loads hard constraints from explicit hard file", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-hard-file-");
+    await fs.writeFile(
+      path.join(workspaceDir, "PROMPT_HARD_CONSTRAINTS.md"),
+      "[猫是大老鼠]\n",
+      "utf-8",
+    );
+    const cfg = createPromptReinforcerConfig({
+      enforceOutput: true,
+      enforceFailClosed: true,
+      enforceFailClosedMessage: "硬约束冲突，已拦截。",
+      enforceHardFile: "PROMPT_HARD_CONSTRAINTS.md",
+      lines: ["风格规则"],
+    });
+    const payloads = await enforcePromptReinforcerOutput({
+      payloads: [{ text: "猫不是大老鼠。" }],
+      cfg,
+      workspaceDir,
+      agentDir: workspaceDir,
+      provider: "openai-codex",
+      model: "gpt-5.3-codex",
+      guardRunner: async () => ({ compliant: true }),
+    });
+    expect(payloads[0]?.text).toBe("硬约束冲突，已拦截。");
   });
 
   it("fails closed when guard cannot return a decision", async () => {
