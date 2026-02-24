@@ -103,4 +103,63 @@ describe("loadModelCatalog", () => {
     expect(spark?.name).toBe("gpt-5.3-codex-spark");
     expect(spark?.reasoning).toBe(true);
   });
+
+  it("includes configured provider models from models.json when registry omits them", async () => {
+    const cfg = {
+      models: {
+        providers: {
+          kilocode: {
+            baseUrl: "https://api.kilo.ai/api/gateway/",
+            api: "openai-completions",
+            models: [
+              {
+                id: "anthropic/claude-opus-4.6",
+                name: "Claude Opus 4.6",
+                reasoning: true,
+                input: ["text", "image"],
+                contextWindow: 200000,
+                maxTokens: 8192,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              },
+              {
+                id: "openai/gpt-5.2",
+                name: "GPT-5.2",
+                reasoning: true,
+                input: ["text"],
+                contextWindow: 400000,
+                maxTokens: 8192,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              },
+            ],
+          },
+        },
+      },
+    } satisfies OpenClawConfig;
+
+    __setModelCatalogImportForTest(
+      async () =>
+        ({
+          AuthStorage: class {},
+          ModelRegistry: class {
+            getAll() {
+              return [{ id: "gpt-4.1", name: "GPT-4.1", provider: "openai" }];
+            }
+          },
+        }) as unknown as PiSdkModule,
+    );
+
+    const result = await loadModelCatalog({ config: cfg });
+    expect(result).toContainEqual(
+      expect.objectContaining({
+        provider: "kilocode",
+        id: "anthropic/claude-opus-4.6",
+      }),
+    );
+    expect(result).toContainEqual(
+      expect.objectContaining({
+        provider: "kilocode",
+        id: "openai/gpt-5.2",
+      }),
+    );
+  });
 });

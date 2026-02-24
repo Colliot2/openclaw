@@ -3,6 +3,7 @@ import type { OpenClawConfig } from "../config/config.js";
 import {
   applyModelAllowlist,
   applyModelFallbacksFromSelection,
+  pruneKilocodeProviderModelsToAllowlist,
   promptDefaultModel,
   promptModelAllowlist,
 } from "./model-picker.js";
@@ -247,5 +248,62 @@ describe("applyModelFallbacksFromSelection", () => {
       primary: "anthropic/claude-opus-4-5",
       fallbacks: ["openai/gpt-5.2"],
     });
+  });
+});
+
+describe("pruneKilocodeProviderModelsToAllowlist", () => {
+  it("keeps only selected model definitions in provider configs", () => {
+    const config = {
+      models: {
+        providers: {
+          kilocode: {
+            baseUrl: "https://api.kilo.ai/api/gateway/",
+            api: "openai-completions",
+            models: [
+              { id: "anthropic/claude-opus-4.6", name: "Claude Opus 4.6" },
+              { id: "minimax/minimax-m2.5:free", name: "MiniMax M2.5 (Free)" },
+            ],
+          },
+        },
+      },
+    } as OpenClawConfig;
+
+    const next = pruneKilocodeProviderModelsToAllowlist(config, [
+      "kilocode/anthropic/claude-opus-4.6",
+    ]);
+
+    expect(next.models?.providers?.kilocode?.models?.map((model) => model.id)).toEqual([
+      "anthropic/claude-opus-4.6",
+    ]);
+  });
+
+  it("does not modify non-kilo provider model catalogs", () => {
+    const config = {
+      models: {
+        providers: {
+          kilocode: {
+            baseUrl: "https://api.kilo.ai/api/gateway/",
+            api: "openai-completions",
+            models: [{ id: "anthropic/claude-opus-4.6", name: "Claude Opus 4.6" }],
+          },
+          minimax: {
+            baseUrl: "https://api.minimax.io/anthropic",
+            api: "anthropic-messages",
+            models: [{ id: "MiniMax-M2.5", name: "MiniMax M2.5" }],
+          },
+        },
+      },
+    } as OpenClawConfig;
+
+    const next = pruneKilocodeProviderModelsToAllowlist(config, [
+      "kilocode/anthropic/claude-opus-4.6",
+    ]);
+
+    expect(next.models?.providers?.kilocode?.models?.map((model) => model.id)).toEqual([
+      "anthropic/claude-opus-4.6",
+    ]);
+    expect(next.models?.providers?.minimax?.models?.map((model) => model.id)).toEqual([
+      "MiniMax-M2.5",
+    ]);
   });
 });

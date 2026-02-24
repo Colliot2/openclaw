@@ -1,3 +1,4 @@
+import path from "node:path";
 import { type OpenClawConfig, loadConfig } from "../config/config.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { resolveOpenClawAgentDir } from "./agent-paths.js";
@@ -21,6 +22,14 @@ type DiscoveredModel = {
   contextWindow?: number;
   reasoning?: boolean;
   input?: Array<"text" | "image">;
+};
+
+type ConfigModelEntry = {
+  id?: unknown;
+  name?: unknown;
+  contextWindow?: unknown;
+  reasoning?: unknown;
+  input?: unknown;
 };
 
 type PiSdkModule = typeof import("./pi-model-discovery.js");
@@ -78,6 +87,74 @@ function createAuthStorage(AuthStorageLike: unknown, path: string) {
   return new (AuthStorageLike as { new (path: string): unknown })(path);
 }
 
+function toPositiveNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function normalizeInput(modalities: unknown): Array<"text" | "image"> | undefined {
+  if (!Array.isArray(modalities) || modalities.length === 0) {
+    return undefined;
+  }
+  const hasImage = modalities.some((value) => String(value ?? "").toLowerCase() === "image");
+  return hasImage ? ["text", "image"] : ["text"];
+}
+
+function readConfiguredModelsFromConfig(cfg: OpenClawConfig): ModelCatalogEntry[] {
+  const providers = cfg.models?.providers;
+  if (!providers) {
+    return [];
+  }
+  const entries: ModelCatalogEntry[] = [];
+  for (const [providerIdRaw, providerValue] of Object.entries(providers)) {
+    const provider = String(providerIdRaw ?? "").trim();
+    if (!provider || !providerValue) {
+      continue;
+    }
+    const providerModels = (providerValue as { models?: unknown }).models;
+    if (!Array.isArray(providerModels)) {
+      continue;
+    }
+    for (const modelValue of providerModels) {
+      if (!modelValue || typeof modelValue !== "object") {
+        continue;
+      }
+      const model = modelValue as ConfigModelEntry;
+      if (typeof model.id !== "string") {
+        continue;
+      }
+      const id = model.id.trim();
+      if (!id) {
+        continue;
+      }
+      const name = typeof model.name === "string" && model.name.trim() ? model.name.trim() : id;
+      const contextWindow = toPositiveNumber(model.contextWindow);
+      const reasoning = typeof model.reasoning === "boolean" ? model.reasoning : undefined;
+      const input = normalizeInput(model.input);
+      entries.push({ id, name, provider, contextWindow, reasoning, input });
+    }
+  }
+  return entries;
+}
+
+function mergeMissingCatalogEntries(
+  discoveredModels: ModelCatalogEntry[],
+  configuredModels: ModelCatalogEntry[],
+): ModelCatalogEntry[] {
+  const seen = new Set(
+    discoveredModels.map((entry) => `${entry.provider.toLowerCase()}/${entry.id.toLowerCase()}`),
+  );
+  const merged = [...discoveredModels];
+  for (const entry of configuredModels) {
+    const key = `${entry.provider.toLowerCase()}/${entry.id.toLowerCase()}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(entry);
+  }
+  return merged;
+}
+
 export async function loadModelCatalog(params?: {
   config?: OpenClawConfig;
   useCache?: boolean;
@@ -111,8 +188,7 @@ export async function loadModelCatalog(params?: {
       // will keep failing until restart).
       const piSdk = await importPiSdk();
       const agentDir = resolveOpenClawAgentDir();
-      const { join } = await import("node:path");
-      const authStorage = createAuthStorage(piSdk.AuthStorage, join(agentDir, "auth.json"));
+      const authStorage = createAuthStorage(piSdk.AuthStorage, path.join(agentDir, "auth.json"));
       const registry = new (piSdk.ModelRegistry as unknown as {
         new (
           authStorage: unknown,
@@ -122,7 +198,7 @@ export async function loadModelCatalog(params?: {
           | {
               getAll: () => Array<DiscoveredModel>;
             };
-      })(authStorage, join(agentDir, "models.json"));
+      })(authStorage, path.join(agentDir, "models.json"));
       const entries = Array.isArray(registry) ? registry : registry.getAll();
       for (const entry of entries) {
         const id = String(entry?.id ?? "").trim();
@@ -142,6 +218,10 @@ export async function loadModelCatalog(params?: {
         const input = Array.isArray(entry?.input) ? entry.input : undefined;
         models.push({ id, name, provider, contextWindow, reasoning, input });
       }
+      const configuredModels = readConfiguredModelsFromConfig(cfg);
+      const mergedModels = mergeMissingCatalogEntries(models, configuredModels);
+      models.length = 0;
+      models.push(...mergedModels);
       applyOpenAICodexSparkFallback(models);
 
       if (models.length === 0) {
