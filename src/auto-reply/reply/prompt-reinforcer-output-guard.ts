@@ -13,7 +13,7 @@ import type { ReplyPayload } from "../types.js";
 
 const DEFAULT_MAX_PASSES = 2;
 const MIN_MAX_PASSES = 1;
-const MAX_MAX_PASSES = 3;
+const MAX_MAX_PASSES = 10;
 const DEFAULT_TEMPERATURE = 0;
 const MIN_TEMPERATURE = 0;
 const MAX_TEMPERATURE = 1;
@@ -30,6 +30,7 @@ type PromptPolicyGuardRunner = (params: {
   policy: string;
   candidate: string;
   pass: number;
+  hardConstraints: string[];
 }) => Promise<PromptPolicyGuardDecision | null>;
 
 type GuardSettings = {
@@ -99,6 +100,172 @@ function resolveGuardSettings(raw: Record<string, unknown>): GuardSettings {
   };
 }
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeCompactText(value: string): string {
+  return value.replace(/\s+/g, "").trim();
+}
+
+function normalizeConstraint(value: string): string {
+  return normalizeCompactText(value).toLowerCase();
+}
+
+function uniqueConstraints(constraints: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of constraints) {
+    const trimmed = item.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const key = normalizeConstraint(trimmed);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+type ExtractHardConstraintsOptions = {
+  allowPlainLines?: boolean;
+};
+
+export function extractHardConstraints(
+  text: string,
+  opts: ExtractHardConstraintsOptions = {},
+): string[] {
+  const lines = text.split(/\r?\n/);
+  const bracketOnly: string[] = [];
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+    const bracketMatch = line.match(/^(?:[-*+]\s*)?\[([^\]\r\n]{1,220})\]$/);
+    if (bracketMatch?.[1]?.trim()) {
+      bracketOnly.push(bracketMatch[1].trim());
+      continue;
+    }
+    const hardPrefixMatch = line.match(/^(?:[-*+]\s*)?(?:HC|HARD)\s*:\s*(.+)$/i);
+    if (hardPrefixMatch?.[1]?.trim()) {
+      bracketOnly.push(hardPrefixMatch[1].trim());
+    }
+  }
+  if (bracketOnly.length > 0 || !opts.allowPlainLines) {
+    return uniqueConstraints(bracketOnly);
+  }
+  const plainLines: string[] = [];
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith(">") || line.startsWith("```")) {
+      continue;
+    }
+    const unlisted = line.replace(/^(?:[-*+]\s+|\d+\.\s+)/, "").trim();
+    if (!unlisted || unlisted.length > 220) {
+      continue;
+    }
+    plainLines.push(unlisted);
+  }
+  return uniqueConstraints(plainLines);
+}
+
+type HardConstraintCheck = {
+  compliant: boolean;
+  missing: string[];
+  contradictions: string[];
+};
+
+type NegationPattern = {
+  target: "raw" | "compact";
+  regex: RegExp;
+};
+
+function buildNegationPatterns(constraint: string): NegationPattern[] {
+  const patterns: NegationPattern[] = [];
+  const compact = normalizeCompactText(constraint);
+  const cnMatch = compact.match(/^(.+?)是(.+)$/);
+  if (cnMatch?.[1] && cnMatch[2]) {
+    const lhs = escapeRegex(cnMatch[1]);
+    const rhs = escapeRegex(cnMatch[2]);
+    patterns.push({
+      target: "compact",
+      regex: new RegExp(`${lhs}(?:不是|并非|不属于|并不属于|并不是)${rhs}`),
+    });
+  }
+  const enMatch = constraint.trim().match(/^(.+?)\s+is\s+(.+)$/i);
+  if (enMatch?.[1] && enMatch[2]) {
+    const lhs = escapeRegex(enMatch[1].trim()).replace(/\s+/g, "\\s+");
+    const rhs = escapeRegex(enMatch[2].trim()).replace(/\s+/g, "\\s+");
+    patterns.push({
+      target: "raw",
+      regex: new RegExp(`\\b${lhs}\\s+is\\s+not\\s+${rhs}\\b`, "i"),
+    });
+    patterns.push({
+      target: "raw",
+      regex: new RegExp(`\\b${lhs}\\s+isn['’]?t\\s+${rhs}\\b`, "i"),
+    });
+  }
+  return patterns;
+}
+
+export function evaluateHardConstraints(params: {
+  candidate: string;
+  hardConstraints: string[];
+}): HardConstraintCheck {
+  const hardConstraints = uniqueConstraints(params.hardConstraints);
+  if (hardConstraints.length === 0) {
+    return { compliant: true, missing: [], contradictions: [] };
+  }
+  const compactCandidate = normalizeConstraint(params.candidate);
+  const missing: string[] = [];
+  const contradictions: string[] = [];
+  for (const hardConstraint of hardConstraints) {
+    const normalized = normalizeConstraint(hardConstraint);
+    if (!compactCandidate.includes(normalized)) {
+      missing.push(hardConstraint);
+    }
+    const negationPatterns = buildNegationPatterns(hardConstraint);
+    const hasNegation = negationPatterns.some((pattern) =>
+      pattern.target === "compact"
+        ? pattern.regex.test(normalizeCompactText(params.candidate))
+        : pattern.regex.test(params.candidate),
+    );
+    if (hasNegation) {
+      contradictions.push(hardConstraint);
+    }
+  }
+  return {
+    compliant: missing.length === 0 && contradictions.length === 0,
+    missing,
+    contradictions,
+  };
+}
+
+function resolveHardConstraintSource(raw: Record<string, unknown>): Record<string, unknown> | null {
+  const source: Record<string, unknown> = {
+    file: raw.enforceHardFile,
+    path: raw.enforceHardPath,
+    files: raw.enforceHardFiles,
+    paths: raw.enforceHardPaths,
+    content: raw.enforceHardContent,
+    lines: raw.enforceHardLines,
+  };
+  const hasAny = Object.values(source).some((value) => {
+    if (typeof value === "string") {
+      return value.trim().length > 0;
+    }
+    if (Array.isArray(value)) {
+      return value.length > 0;
+    }
+    return value != null;
+  });
+  return hasAny ? source : null;
+}
+
 function extractJsonObject(rawText: string): string | null {
   const first = rawText.indexOf("{");
   const last = rawText.lastIndexOf("}");
@@ -140,9 +307,11 @@ export async function enforcePromptPolicyText(params: {
   policy: string;
   maxPasses: number;
   guardRunner: PromptPolicyGuardRunner;
+  hardConstraints?: string[];
 }): Promise<{ text: string; compliant: boolean; changed: boolean }> {
   let current = params.text;
   let changed = false;
+  const hardConstraints = uniqueConstraints(params.hardConstraints ?? []);
   const maxPasses = clampInteger(
     params.maxPasses,
     DEFAULT_MAX_PASSES,
@@ -154,12 +323,25 @@ export async function enforcePromptPolicyText(params: {
       policy: params.policy,
       candidate: current,
       pass,
+      hardConstraints,
     });
     if (!decision) {
       return { text: current, compliant: false, changed };
     }
     if (decision.compliant) {
-      return { text: current, compliant: true, changed };
+      const hardCheck = evaluateHardConstraints({
+        candidate: current,
+        hardConstraints,
+      });
+      if (hardCheck.compliant) {
+        return { text: current, compliant: true, changed };
+      }
+      const rewritten = decision.rewritten?.trim();
+      if (rewritten && rewritten !== current) {
+        current = rewritten;
+        changed = true;
+      }
+      continue;
     }
     const rewritten = decision.rewritten?.trim();
     if (!rewritten) {
@@ -173,9 +355,13 @@ export async function enforcePromptPolicyText(params: {
   return { text: current, compliant: false, changed };
 }
 
-function buildGuardPrompt(params: { policy: string; candidate: string }): string {
-  const { policy, candidate } = params;
-  return [
+function buildGuardPrompt(params: {
+  policy: string;
+  candidate: string;
+  hardConstraints: string[];
+}): string {
+  const { policy, candidate, hardConstraints } = params;
+  const sections = [
     "You are a strict response policy enforcer.",
     'Return exactly one JSON object: {"compliant":boolean,"rewritten":string}.',
     `If the candidate fully complies with policy and has no contradictions, set compliant=true and rewritten="${EXACT_ORIGINAL_TOKEN}".`,
@@ -190,7 +376,19 @@ function buildGuardPrompt(params: { policy: string; candidate: string }): string
     "<candidate>",
     candidate,
     "</candidate>",
-  ].join("\n");
+  ];
+  if (hardConstraints.length > 0) {
+    sections.push(
+      "",
+      "<hard_constraints>",
+      ...hardConstraints.map((constraint, index) => `${index + 1}. ${constraint}`),
+      "</hard_constraints>",
+      "",
+      "The rewritten text MUST include every hard constraint sentence verbatim.",
+      "The rewritten text MUST NOT negate or contradict any hard constraint.",
+    );
+  }
+  return sections.join("\n");
 }
 
 async function createDefaultGuardRunner(params: {
@@ -225,7 +423,7 @@ async function createDefaultGuardRunner(params: {
     );
     return null;
   }
-  return async ({ policy, candidate }) => {
+  return async ({ policy, candidate, hardConstraints }) => {
     const maxTokens = Math.min(2048, Math.max(256, Math.ceil(candidate.length * 1.5)));
     const completion = await completeSimple(
       resolved.model!,
@@ -233,7 +431,7 @@ async function createDefaultGuardRunner(params: {
         messages: [
           {
             role: "user",
-            content: buildGuardPrompt({ policy, candidate }),
+            content: buildGuardPrompt({ policy, candidate, hardConstraints }),
             timestamp: Date.now(),
           },
         ],
@@ -287,6 +485,22 @@ export async function enforcePromptReinforcerOutput(params: {
   if (!policy) {
     return params.payloads;
   }
+  const hardConstraintSource = resolveHardConstraintSource(raw);
+  const hardSourceSnippets = hardConstraintSource
+    ? await loadPromptSnippets({
+        workspaceDir: params.workspaceDir,
+        raw: hardConstraintSource,
+        onReadError: (absolutePath) => {
+          defaultRuntime.error(
+            `[prompt-reinforcer] failed to read hard constraints: ${absolutePath}`,
+          );
+        },
+      })
+    : [];
+  const hardConstraintText = hardConstraintSource ? joinPromptPolicy(hardSourceSnippets) : policy;
+  const hardConstraints = extractHardConstraints(hardConstraintText, {
+    allowPlainLines: hardConstraintSource != null,
+  });
 
   let guardRunner: PromptPolicyGuardRunner | null | undefined = params.guardRunner;
   if (!guardRunner) {
@@ -323,6 +537,7 @@ export async function enforcePromptReinforcerOutput(params: {
         policy,
         maxPasses: settings.maxPasses,
         guardRunner,
+        hardConstraints,
       });
       if (outcome.compliant || outcome.changed) {
         nextPayloads.push({ ...payload, text: outcome.text });
