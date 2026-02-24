@@ -79,6 +79,22 @@ type GuardSettings = {
   memoryRecallFailMessage: string;
 };
 
+export type PromptReinforcerOutputBlockReason =
+  | "memory_search_required"
+  | "policy_guard_blocked"
+  | "guard_unavailable";
+
+export type PromptReinforcerOutputReport = {
+  blocked: boolean;
+  retryable: boolean;
+  reason?: PromptReinforcerOutputBlockReason;
+};
+
+export type PromptReinforcerOutputResult = {
+  payloads: ReplyPayload[];
+  report: PromptReinforcerOutputReport;
+};
+
 function isTextContentBlock(block: unknown): block is TextContent {
   return (
     typeof block === "object" &&
@@ -265,14 +281,9 @@ export function evaluateHardConstraints(params: {
   if (hardConstraints.length === 0) {
     return { compliant: true, missing: [], contradictions: [] };
   }
-  const compactCandidate = normalizeConstraint(params.candidate);
   const missing: string[] = [];
   const contradictions: string[] = [];
   for (const hardConstraint of hardConstraints) {
-    const normalized = normalizeConstraint(hardConstraint);
-    if (!compactCandidate.includes(normalized)) {
-      missing.push(hardConstraint);
-    }
     const negationPatterns = buildNegationPatterns(hardConstraint);
     const hasNegation = negationPatterns.some((pattern) =>
       pattern.target === "compact"
@@ -284,7 +295,7 @@ export function evaluateHardConstraints(params: {
     }
   }
   return {
-    compliant: missing.length === 0 && contradictions.length === 0,
+    compliant: contradictions.length === 0,
     missing,
     contradictions,
   };
@@ -496,7 +507,7 @@ function buildGuardPrompt(params: {
       ...hardConstraints.map((constraint, index) => `${index + 1}. ${constraint}`),
       "</hard_constraints>",
       "",
-      "The rewritten text MUST include every hard constraint sentence verbatim.",
+      "The rewritten text MUST stay semantically consistent with every hard constraint sentence (verbatim quote is optional).",
       "The rewritten text MUST NOT negate or contradict any hard constraint.",
     );
   }
@@ -640,7 +651,25 @@ function normalizeToolNames(toolNames: string[] | undefined): string[] {
   return out;
 }
 
-export async function enforcePromptReinforcerOutput(params: {
+function passOutput(payloads: ReplyPayload[]): PromptReinforcerOutputResult {
+  return {
+    payloads,
+    report: { blocked: false, retryable: false },
+  };
+}
+
+function blockedOutput(
+  payloads: ReplyPayload[],
+  reason: PromptReinforcerOutputBlockReason,
+  retryable: boolean,
+): PromptReinforcerOutputResult {
+  return {
+    payloads,
+    report: { blocked: true, retryable, reason },
+  };
+}
+
+export async function enforcePromptReinforcerOutputWithReport(params: {
   payloads: ReplyPayload[];
   cfg: OpenClawConfig;
   workspaceDir: string;
@@ -651,15 +680,15 @@ export async function enforcePromptReinforcerOutput(params: {
   latestUserPrompt?: string;
   usedToolNames?: string[];
   guardRunner?: PromptPolicyGuardRunner;
-}): Promise<ReplyPayload[]> {
+}): Promise<PromptReinforcerOutputResult> {
   const hookConfig = resolveHookConfig(params.cfg, PROMPT_REINFORCER_HOOK_KEY);
   if (!hookConfig || hookConfig.enabled === false) {
-    return params.payloads;
+    return passOutput(params.payloads);
   }
   const raw = hookConfig as Record<string, unknown>;
   const settings = resolveGuardSettings(raw);
   if (!settings.enabled) {
-    return params.payloads;
+    return passOutput(params.payloads);
   }
 
   const snippets = await loadPromptSnippets({
@@ -671,7 +700,7 @@ export async function enforcePromptReinforcerOutput(params: {
   });
   const policy = joinPromptPolicy(snippets);
   if (!policy) {
-    return params.payloads;
+    return passOutput(params.payloads);
   }
   const hardConstraintSource = resolveHardConstraintSource(raw);
   const hardSourceSnippets = hardConstraintSource
@@ -719,9 +748,12 @@ export async function enforcePromptReinforcerOutput(params: {
     defaultRuntime.error(
       `[prompt-reinforcer] output guard unavailable: failClosed=${settings.failClosed ? 1 : 0}`,
     );
-    return settings.failClosed
+    const payloads = settings.failClosed
       ? params.payloads.map((payload) => withFailClosed(payload, settings.failClosedMessage))
       : params.payloads;
+    return settings.failClosed
+      ? blockedOutput(payloads, "guard_unavailable", false)
+      : passOutput(payloads);
   }
 
   const usedTools = normalizeToolNames(params.usedToolNames);
@@ -732,12 +764,15 @@ export async function enforcePromptReinforcerOutput(params: {
     defaultRuntime.error(
       `[prompt-reinforcer] output guard result: status=blocked reason=memory_search_required prompt=${summarizeTextForLog(params.latestUserPrompt ?? "")} usedTools=${usedTools.join(",") || "-"}`,
     );
-    return params.payloads.map((payload) =>
-      withFailClosed(payload, settings.memoryRecallFailMessage),
+    return blockedOutput(
+      params.payloads.map((payload) => withFailClosed(payload, settings.memoryRecallFailMessage)),
+      "memory_search_required",
+      true,
     );
   }
 
   const nextPayloads: ReplyPayload[] = [];
+  let blockedByPolicy = false;
   for (const [payloadIndex, payload] of params.payloads.entries()) {
     if (payload.isError || typeof payload.text !== "string" || payload.text.trim().length === 0) {
       nextPayloads.push(payload);
@@ -779,6 +814,7 @@ export async function enforcePromptReinforcerOutput(params: {
       nextPayloads.push(
         settings.failClosed ? withFailClosed(payload, settings.failClosedMessage) : payload,
       );
+      blockedByPolicy = blockedByPolicy || settings.failClosed;
     } catch (err) {
       defaultRuntime.error(
         `[prompt-reinforcer] output guard execution failed: payload=${payloadIndex + 1} ${String(err)}`,
@@ -786,7 +822,26 @@ export async function enforcePromptReinforcerOutput(params: {
       nextPayloads.push(
         settings.failClosed ? withFailClosed(payload, settings.failClosedMessage) : payload,
       );
+      blockedByPolicy = blockedByPolicy || settings.failClosed;
     }
   }
-  return nextPayloads;
+  return blockedByPolicy
+    ? blockedOutput(nextPayloads, "policy_guard_blocked", true)
+    : passOutput(nextPayloads);
+}
+
+export async function enforcePromptReinforcerOutput(params: {
+  payloads: ReplyPayload[];
+  cfg: OpenClawConfig;
+  workspaceDir: string;
+  agentDir: string;
+  provider: string;
+  model: string;
+  authProfileId?: string;
+  latestUserPrompt?: string;
+  usedToolNames?: string[];
+  guardRunner?: PromptPolicyGuardRunner;
+}): Promise<ReplyPayload[]> {
+  const result = await enforcePromptReinforcerOutputWithReport(params);
+  return result.payloads;
 }

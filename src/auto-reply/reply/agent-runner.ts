@@ -6,6 +6,7 @@ import { resolveModelAuthMode } from "../../agents/model-auth.js";
 import { isCliProvider } from "../../agents/model-selection.js";
 import { queueEmbeddedPiMessage } from "../../agents/pi-embedded.js";
 import { hasNonzeroUsage } from "../../agents/usage.js";
+import type { OpenClawConfig } from "../../config/config.js";
 import {
   resolveAgentIdFromSessionKey,
   resolveSessionFilePath,
@@ -15,8 +16,10 @@ import {
   updateSessionStoreEntry,
 } from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
+import { resolveHookConfig } from "../../hooks/config.js";
 import { emitDiagnosticEvent, isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
 import { enqueueSystemEvent } from "../../infra/system-events.js";
+import { PROMPT_REINFORCER_HOOK_KEY } from "../../prompt-reinforcer/policy.js";
 import { defaultRuntime } from "../../runtime.js";
 import { estimateUsageCost, resolveModelCostConfig } from "../../utils/usage-format.js";
 import type { OriginatingChannelType, TemplateContext } from "../templating.js";
@@ -43,7 +46,10 @@ import {
   readSessionMessages,
 } from "./post-compaction-audit.js";
 import { readPostCompactionContext } from "./post-compaction-context.js";
-import { enforcePromptReinforcerOutput } from "./prompt-reinforcer-output-guard.js";
+import {
+  type PromptReinforcerOutputBlockReason,
+  enforcePromptReinforcerOutputWithReport,
+} from "./prompt-reinforcer-output-guard.js";
 import { enqueueFollowupRun, type FollowupRun, type QueueSettings } from "./queue.js";
 import { createReplyToModeFilterForChannel, resolveReplyToMode } from "./reply-threading.js";
 import { incrementRunCompactionCount, persistRunSessionUsage } from "./session-run-accounting.js";
@@ -51,12 +57,62 @@ import { createTypingSignaler } from "./typing-mode.js";
 import type { TypingController } from "./typing.js";
 
 const BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000;
+const PROMPT_REINFORCER_RETRY_DEFAULT_MAX_ATTEMPTS = 2;
+const PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS = 1;
+const PROMPT_REINFORCER_RETRY_MAX_ATTEMPTS = 10;
 const UNSCHEDULED_REMINDER_NOTE =
   "Note: I did not schedule a reminder in this turn, so this will not trigger automatically.";
 const REMINDER_COMMITMENT_PATTERNS: RegExp[] = [
   /\b(?:i\s*['’]?ll|i will)\s+(?:make sure to\s+)?(?:remember|remind|ping|follow up|follow-up|check back|circle back)\b/i,
   /\b(?:i\s*['’]?ll|i will)\s+(?:set|create|schedule)\s+(?:a\s+)?reminder\b/i,
 ];
+
+function clampPromptReinforcerAttempts(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return PROMPT_REINFORCER_RETRY_DEFAULT_MAX_ATTEMPTS;
+  }
+  const rounded = Math.trunc(value);
+  return Math.min(
+    PROMPT_REINFORCER_RETRY_MAX_ATTEMPTS,
+    Math.max(PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS, rounded),
+  );
+}
+
+function resolvePromptReinforcerLoopSettings(cfg: OpenClawConfig): {
+  enabled: boolean;
+  maxAttempts: number;
+} {
+  const hookConfig = resolveHookConfig(cfg, PROMPT_REINFORCER_HOOK_KEY);
+  if (!hookConfig || hookConfig.enabled === false) {
+    return { enabled: false, maxAttempts: PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS };
+  }
+  const raw = hookConfig as Record<string, unknown>;
+  const enabled = raw.enforceOutput === true;
+  return {
+    enabled,
+    maxAttempts: enabled
+      ? clampPromptReinforcerAttempts(raw.enforceMaxPasses)
+      : PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS,
+  };
+}
+
+function isRetryablePromptReinforcerReason(
+  reason: PromptReinforcerOutputBlockReason | undefined,
+): boolean {
+  return reason === "memory_search_required" || reason === "policy_guard_blocked";
+}
+
+function buildPromptReinforcerRetryInstruction(params: {
+  reason: PromptReinforcerOutputBlockReason;
+  attempt: number;
+  maxAttempts: number;
+}): string {
+  const prefix = `Prompt policy auto-retry ${params.attempt}/${params.maxAttempts}.`;
+  if (params.reason === "memory_search_required") {
+    return `${prefix} Previous draft was blocked because memory recall was required. In this retry, you MUST run memory_search first, then answer from retrieved memory evidence.`;
+  }
+  return `${prefix} Previous draft violated output policy or hard constraints. Regenerate a fully compliant response and do not emit any fail-closed placeholder text.`;
+}
 
 function hasUnbackedReminderCommitment(text: string): boolean {
   const normalized = text.toLowerCase();
@@ -152,7 +208,23 @@ export async function runReplyAgent(params: {
   const activeSessionStore = sessionStore;
   let activeIsNewSession = isNewSession;
 
-  const isHeartbeat = opts?.isHeartbeat === true;
+  const cfg = followupRun.run.config;
+  const promptReinforcerLoop = resolvePromptReinforcerLoopSettings(cfg);
+  const effectiveOpts =
+    promptReinforcerLoop.enabled && opts
+      ? {
+          ...opts,
+          // Do not stream unchecked output when output guard is active.
+          onPartialReply: undefined,
+          onBlockReply: undefined,
+          onToolResult: undefined,
+        }
+      : opts;
+  const effectiveBlockStreamingEnabled = promptReinforcerLoop.enabled
+    ? false
+    : blockStreamingEnabled;
+
+  const isHeartbeat = effectiveOpts?.isHeartbeat === true;
   const typingSignals = createTypingSignaler({
     typing,
     mode: typingMode,
@@ -171,7 +243,7 @@ export async function runReplyAgent(params: {
   });
 
   const pendingToolTasks = new Set<Promise<void>>();
-  const blockReplyTimeoutMs = opts?.blockReplyTimeoutMs ?? BLOCK_REPLY_SEND_TIMEOUT_MS;
+  const blockReplyTimeoutMs = effectiveOpts?.blockReplyTimeoutMs ?? BLOCK_REPLY_SEND_TIMEOUT_MS;
 
   const replyToChannel =
     sessionCtx.OriginatingChannel ??
@@ -185,9 +257,8 @@ export async function runReplyAgent(params: {
     sessionCtx.ChatType,
   );
   const applyReplyToMode = createReplyToModeFilterForChannel(replyToMode, replyToChannel);
-  const cfg = followupRun.run.config;
   const blockReplyCoalescing =
-    blockStreamingEnabled && opts?.onBlockReply
+    effectiveBlockStreamingEnabled && effectiveOpts?.onBlockReply
       ? resolveBlockStreamingCoalescing(
           cfg,
           sessionCtx.Provider,
@@ -196,9 +267,9 @@ export async function runReplyAgent(params: {
         )
       : undefined;
   const blockReplyPipeline =
-    blockStreamingEnabled && opts?.onBlockReply
+    effectiveBlockStreamingEnabled && effectiveOpts?.onBlockReply
       ? createBlockReplyPipeline({
-          onBlockReply: opts.onBlockReply,
+          onBlockReply: effectiveOpts.onBlockReply,
           timeoutMs: blockReplyTimeoutMs,
           coalescing: blockReplyCoalescing,
           buffer: createAudioAsVoiceBuffer({ isAudioPayload }),
@@ -344,287 +415,324 @@ export async function runReplyAgent(params: {
         `Role ordering conflict (${reason}). Restarting session ${sessionKey} -> ${nextSessionId}.`,
       cleanupTranscripts: true,
     });
+  const baseExtraSystemPrompt = followupRun.run.extraSystemPrompt;
+  let lastGuardRetryReason: PromptReinforcerOutputBlockReason | undefined;
   try {
-    const runStartedAt = Date.now();
-    const runOutcome = await runAgentTurnWithFallback({
-      commandBody,
-      followupRun,
-      sessionCtx,
-      opts,
-      typingSignals,
-      blockReplyPipeline,
-      blockStreamingEnabled,
-      blockReplyChunking,
-      resolvedBlockStreamingBreak,
-      applyReplyToMode,
-      shouldEmitToolResult,
-      shouldEmitToolOutput,
-      pendingToolTasks,
-      resetSessionAfterCompactionFailure,
-      resetSessionAfterRoleOrderingConflict,
-      isHeartbeat,
-      sessionKey,
-      getActiveSessionEntry: () => activeSessionEntry,
-      activeSessionStore,
-      storePath,
-      resolvedVerboseLevel,
-    });
+    for (let attempt = 1; attempt <= promptReinforcerLoop.maxAttempts; attempt += 1) {
+      responseUsageLine = undefined;
+      if (promptReinforcerLoop.enabled && lastGuardRetryReason) {
+        const retryInstruction = buildPromptReinforcerRetryInstruction({
+          reason: lastGuardRetryReason,
+          attempt,
+          maxAttempts: promptReinforcerLoop.maxAttempts,
+        });
+        followupRun.run.extraSystemPrompt = [baseExtraSystemPrompt, retryInstruction]
+          .filter(Boolean)
+          .join("\n\n");
+      } else {
+        followupRun.run.extraSystemPrompt = baseExtraSystemPrompt;
+      }
 
-    if (runOutcome.kind === "final") {
-      return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
-    }
+      const runStartedAt = Date.now();
+      const runOutcome = await runAgentTurnWithFallback({
+        commandBody,
+        followupRun,
+        sessionCtx,
+        opts: effectiveOpts,
+        typingSignals,
+        blockReplyPipeline,
+        blockStreamingEnabled: effectiveBlockStreamingEnabled,
+        blockReplyChunking,
+        resolvedBlockStreamingBreak,
+        applyReplyToMode,
+        shouldEmitToolResult,
+        shouldEmitToolOutput,
+        pendingToolTasks,
+        resetSessionAfterCompactionFailure,
+        resetSessionAfterRoleOrderingConflict,
+        isHeartbeat,
+        sessionKey,
+        getActiveSessionEntry: () => activeSessionEntry,
+        activeSessionStore,
+        storePath,
+        resolvedVerboseLevel,
+      });
 
-    const { runResult, fallbackProvider, fallbackModel, directlySentBlockKeys } = runOutcome;
-    let { didLogHeartbeatStrip, autoCompactionCompleted } = runOutcome;
+      if (runOutcome.kind === "final") {
+        return finalizeWithFollowup(runOutcome.payload, queueKey, runFollowupTurn);
+      }
 
-    if (
-      shouldInjectGroupIntro &&
-      activeSessionEntry &&
-      activeSessionStore &&
-      sessionKey &&
-      activeSessionEntry.groupActivationNeedsSystemIntro
-    ) {
-      const updatedAt = Date.now();
-      activeSessionEntry.groupActivationNeedsSystemIntro = false;
-      activeSessionEntry.updatedAt = updatedAt;
-      activeSessionStore[sessionKey] = activeSessionEntry;
-      if (storePath) {
-        await updateSessionStoreEntry({
-          storePath,
+      const { runResult, fallbackProvider, fallbackModel, directlySentBlockKeys } = runOutcome;
+      let { didLogHeartbeatStrip, autoCompactionCompleted } = runOutcome;
+
+      if (
+        shouldInjectGroupIntro &&
+        activeSessionEntry &&
+        activeSessionStore &&
+        sessionKey &&
+        activeSessionEntry.groupActivationNeedsSystemIntro
+      ) {
+        const updatedAt = Date.now();
+        activeSessionEntry.groupActivationNeedsSystemIntro = false;
+        activeSessionEntry.updatedAt = updatedAt;
+        activeSessionStore[sessionKey] = activeSessionEntry;
+        if (storePath) {
+          await updateSessionStoreEntry({
+            storePath,
+            sessionKey,
+            update: async () => ({
+              groupActivationNeedsSystemIntro: false,
+              updatedAt,
+            }),
+          });
+        }
+      }
+
+      const payloadArray = runResult.payloads ?? [];
+
+      if (blockReplyPipeline) {
+        await blockReplyPipeline.flush({ force: true });
+        blockReplyPipeline.stop();
+      }
+      if (pendingToolTasks.size > 0) {
+        await Promise.allSettled(pendingToolTasks);
+      }
+
+      const usage = runResult.meta?.agentMeta?.usage;
+      const promptTokens = runResult.meta?.agentMeta?.promptTokens;
+      const modelUsed = runResult.meta?.agentMeta?.model ?? fallbackModel ?? defaultModel;
+      const providerUsed =
+        runResult.meta?.agentMeta?.provider ?? fallbackProvider ?? followupRun.run.provider;
+      const cliSessionId = isCliProvider(providerUsed, cfg)
+        ? runResult.meta?.agentMeta?.sessionId?.trim()
+        : undefined;
+      const contextTokensUsed =
+        agentCfgContextTokens ??
+        lookupContextTokens(modelUsed) ??
+        activeSessionEntry?.contextTokens ??
+        DEFAULT_CONTEXT_TOKENS;
+
+      await persistRunSessionUsage({
+        storePath,
+        sessionKey,
+        usage,
+        lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
+        promptTokens,
+        modelUsed,
+        providerUsed,
+        contextTokensUsed,
+        systemPromptReport: runResult.meta?.systemPromptReport,
+        cliSessionId,
+      });
+
+      // Drain any late tool/block deliveries before deciding there's "nothing to send".
+      // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
+      // keep the typing indicator stuck.
+      if (payloadArray.length === 0) {
+        return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+      }
+
+      const payloadResult = buildReplyPayloads({
+        payloads: payloadArray,
+        isHeartbeat,
+        didLogHeartbeatStrip,
+        blockStreamingEnabled: effectiveBlockStreamingEnabled,
+        blockReplyPipeline,
+        directlySentBlockKeys,
+        replyToMode,
+        replyToChannel,
+        currentMessageId: sessionCtx.MessageSidFull ?? sessionCtx.MessageSid,
+        messageProvider: followupRun.run.messageProvider,
+        messagingToolSentTexts: runResult.messagingToolSentTexts,
+        messagingToolSentMediaUrls: runResult.messagingToolSentMediaUrls,
+        messagingToolSentTargets: runResult.messagingToolSentTargets,
+        originatingTo: sessionCtx.OriginatingTo ?? sessionCtx.To,
+        accountId: sessionCtx.AccountId,
+      });
+      const { replyPayloads } = payloadResult;
+      didLogHeartbeatStrip = payloadResult.didLogHeartbeatStrip;
+
+      if (replyPayloads.length === 0) {
+        return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
+      }
+
+      const successfulCronAdds = runResult.successfulCronAdds ?? 0;
+      const hasReminderCommitment = replyPayloads.some(
+        (payload) =>
+          !payload.isError &&
+          typeof payload.text === "string" &&
+          hasUnbackedReminderCommitment(payload.text),
+      );
+      const guardedReplyPayloads =
+        hasReminderCommitment && successfulCronAdds === 0
+          ? appendUnscheduledReminderNote(replyPayloads)
+          : replyPayloads;
+
+      await signalTypingIfNeeded(guardedReplyPayloads, typingSignals);
+
+      if (isDiagnosticsEnabled(cfg) && hasNonzeroUsage(usage)) {
+        const input = usage.input ?? 0;
+        const output = usage.output ?? 0;
+        const cacheRead = usage.cacheRead ?? 0;
+        const cacheWrite = usage.cacheWrite ?? 0;
+        const promptTokens = input + cacheRead + cacheWrite;
+        const totalTokens = usage.total ?? promptTokens + output;
+        const costConfig = resolveModelCostConfig({
+          provider: providerUsed,
+          model: modelUsed,
+          config: cfg,
+        });
+        const costUsd = estimateUsageCost({ usage, cost: costConfig });
+        emitDiagnosticEvent({
+          type: "model.usage",
           sessionKey,
-          update: async () => ({
-            groupActivationNeedsSystemIntro: false,
-            updatedAt,
-          }),
+          sessionId: followupRun.run.sessionId,
+          channel: replyToChannel,
+          provider: providerUsed,
+          model: modelUsed,
+          usage: {
+            input,
+            output,
+            cacheRead,
+            cacheWrite,
+            promptTokens,
+            total: totalTokens,
+          },
+          lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
+          context: {
+            limit: contextTokensUsed,
+            used: totalTokens,
+          },
+          costUsd,
+          durationMs: Date.now() - runStartedAt,
         });
       }
-    }
 
-    const payloadArray = runResult.payloads ?? [];
-
-    if (blockReplyPipeline) {
-      await blockReplyPipeline.flush({ force: true });
-      blockReplyPipeline.stop();
-    }
-    if (pendingToolTasks.size > 0) {
-      await Promise.allSettled(pendingToolTasks);
-    }
-
-    const usage = runResult.meta?.agentMeta?.usage;
-    const promptTokens = runResult.meta?.agentMeta?.promptTokens;
-    const modelUsed = runResult.meta?.agentMeta?.model ?? fallbackModel ?? defaultModel;
-    const providerUsed =
-      runResult.meta?.agentMeta?.provider ?? fallbackProvider ?? followupRun.run.provider;
-    const cliSessionId = isCliProvider(providerUsed, cfg)
-      ? runResult.meta?.agentMeta?.sessionId?.trim()
-      : undefined;
-    const contextTokensUsed =
-      agentCfgContextTokens ??
-      lookupContextTokens(modelUsed) ??
-      activeSessionEntry?.contextTokens ??
-      DEFAULT_CONTEXT_TOKENS;
-
-    await persistRunSessionUsage({
-      storePath,
-      sessionKey,
-      usage,
-      lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
-      promptTokens,
-      modelUsed,
-      providerUsed,
-      contextTokensUsed,
-      systemPromptReport: runResult.meta?.systemPromptReport,
-      cliSessionId,
-    });
-
-    // Drain any late tool/block deliveries before deciding there's "nothing to send".
-    // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and
-    // keep the typing indicator stuck.
-    if (payloadArray.length === 0) {
-      return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
-    }
-
-    const payloadResult = buildReplyPayloads({
-      payloads: payloadArray,
-      isHeartbeat,
-      didLogHeartbeatStrip,
-      blockStreamingEnabled,
-      blockReplyPipeline,
-      directlySentBlockKeys,
-      replyToMode,
-      replyToChannel,
-      currentMessageId: sessionCtx.MessageSidFull ?? sessionCtx.MessageSid,
-      messageProvider: followupRun.run.messageProvider,
-      messagingToolSentTexts: runResult.messagingToolSentTexts,
-      messagingToolSentMediaUrls: runResult.messagingToolSentMediaUrls,
-      messagingToolSentTargets: runResult.messagingToolSentTargets,
-      originatingTo: sessionCtx.OriginatingTo ?? sessionCtx.To,
-      accountId: sessionCtx.AccountId,
-    });
-    const { replyPayloads } = payloadResult;
-    didLogHeartbeatStrip = payloadResult.didLogHeartbeatStrip;
-
-    if (replyPayloads.length === 0) {
-      return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
-    }
-
-    const successfulCronAdds = runResult.successfulCronAdds ?? 0;
-    const hasReminderCommitment = replyPayloads.some(
-      (payload) =>
-        !payload.isError &&
-        typeof payload.text === "string" &&
-        hasUnbackedReminderCommitment(payload.text),
-    );
-    const guardedReplyPayloads =
-      hasReminderCommitment && successfulCronAdds === 0
-        ? appendUnscheduledReminderNote(replyPayloads)
-        : replyPayloads;
-
-    await signalTypingIfNeeded(guardedReplyPayloads, typingSignals);
-
-    if (isDiagnosticsEnabled(cfg) && hasNonzeroUsage(usage)) {
-      const input = usage.input ?? 0;
-      const output = usage.output ?? 0;
-      const cacheRead = usage.cacheRead ?? 0;
-      const cacheWrite = usage.cacheWrite ?? 0;
-      const promptTokens = input + cacheRead + cacheWrite;
-      const totalTokens = usage.total ?? promptTokens + output;
-      const costConfig = resolveModelCostConfig({
-        provider: providerUsed,
-        model: modelUsed,
-        config: cfg,
-      });
-      const costUsd = estimateUsageCost({ usage, cost: costConfig });
-      emitDiagnosticEvent({
-        type: "model.usage",
-        sessionKey,
-        sessionId: followupRun.run.sessionId,
-        channel: replyToChannel,
-        provider: providerUsed,
-        model: modelUsed,
-        usage: {
-          input,
-          output,
-          cacheRead,
-          cacheWrite,
-          promptTokens,
-          total: totalTokens,
-        },
-        lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
-        context: {
-          limit: contextTokensUsed,
-          used: totalTokens,
-        },
-        costUsd,
-        durationMs: Date.now() - runStartedAt,
-      });
-    }
-
-    const responseUsageRaw =
-      activeSessionEntry?.responseUsage ??
-      (sessionKey ? activeSessionStore?.[sessionKey]?.responseUsage : undefined);
-    const responseUsageMode = resolveResponseUsageMode(responseUsageRaw);
-    if (responseUsageMode !== "off" && hasNonzeroUsage(usage)) {
-      const authMode = resolveModelAuthMode(providerUsed, cfg);
-      const showCost = authMode === "api-key";
-      const costConfig = showCost
-        ? resolveModelCostConfig({
-            provider: providerUsed,
-            model: modelUsed,
-            config: cfg,
-          })
-        : undefined;
-      let formatted = formatResponseUsageLine({
-        usage,
-        showCost,
-        costConfig,
-      });
-      if (formatted && responseUsageMode === "full" && sessionKey) {
-        formatted = `${formatted} · session ${sessionKey}`;
-      }
-      if (formatted) {
-        responseUsageLine = formatted;
-      }
-    }
-
-    // If verbose is enabled and this is a new session, prepend a session hint.
-    let finalPayloads = guardedReplyPayloads;
-    const verboseEnabled = resolvedVerboseLevel !== "off";
-    if (autoCompactionCompleted) {
-      const count = await incrementRunCompactionCount({
-        sessionEntry: activeSessionEntry,
-        sessionStore: activeSessionStore,
-        sessionKey,
-        storePath,
-        lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
-        contextTokensUsed,
-      });
-
-      // Inject post-compaction workspace context for the next agent turn
-      if (sessionKey) {
-        const workspaceDir = process.cwd();
-        readPostCompactionContext(workspaceDir)
-          .then((contextContent) => {
-            if (contextContent) {
-              enqueueSystemEvent(contextContent, { sessionKey });
-            }
-          })
-          .catch(() => {
-            // Silent failure — post-compaction context is best-effort
-          });
-
-        // Set pending audit flag for Layer 3 (post-compaction read audit)
-        pendingPostCompactionAudits.set(sessionKey, true);
-      }
-
-      if (verboseEnabled) {
-        const suffix = typeof count === "number" ? ` (count ${count})` : "";
-        finalPayloads = [{ text: `🧹 Auto-compaction complete${suffix}.` }, ...finalPayloads];
-      }
-    }
-    if (verboseEnabled && activeIsNewSession) {
-      finalPayloads = [{ text: `🧭 New session: ${followupRun.run.sessionId}` }, ...finalPayloads];
-    }
-    if (responseUsageLine) {
-      finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
-    }
-    finalPayloads = await enforcePromptReinforcerOutput({
-      payloads: finalPayloads,
-      cfg,
-      workspaceDir: followupRun.run.workspaceDir,
-      agentDir: followupRun.run.agentDir,
-      provider: providerUsed,
-      model: modelUsed,
-      authProfileId: followupRun.run.authProfileId,
-      latestUserPrompt: followupRun.prompt,
-      usedToolNames: runResult.meta?.usedTools,
-    });
-
-    // Post-compaction read audit (Layer 3)
-    if (sessionKey && pendingPostCompactionAudits.get(sessionKey)) {
-      pendingPostCompactionAudits.delete(sessionKey); // Delete FIRST — one-shot only
-      try {
-        const sessionFile = activeSessionEntry?.sessionFile;
-        if (sessionFile) {
-          const messages = readSessionMessages(sessionFile);
-          const readPaths = extractReadPaths(messages);
-          const workspaceDir = process.cwd();
-          const audit = auditPostCompactionReads(readPaths, workspaceDir);
-          if (!audit.passed) {
-            enqueueSystemEvent(formatAuditWarning(audit.missingPatterns), { sessionKey });
-          }
+      const responseUsageRaw =
+        activeSessionEntry?.responseUsage ??
+        (sessionKey ? activeSessionStore?.[sessionKey]?.responseUsage : undefined);
+      const responseUsageMode = resolveResponseUsageMode(responseUsageRaw);
+      if (responseUsageMode !== "off" && hasNonzeroUsage(usage)) {
+        const authMode = resolveModelAuthMode(providerUsed, cfg);
+        const showCost = authMode === "api-key";
+        const costConfig = showCost
+          ? resolveModelCostConfig({
+              provider: providerUsed,
+              model: modelUsed,
+              config: cfg,
+            })
+          : undefined;
+        let formatted = formatResponseUsageLine({
+          usage,
+          showCost,
+          costConfig,
+        });
+        if (formatted && responseUsageMode === "full" && sessionKey) {
+          formatted = `${formatted} · session ${sessionKey}`;
         }
-      } catch {
-        // Silent failure — audit is best-effort
+        if (formatted) {
+          responseUsageLine = formatted;
+        }
       }
-    }
 
-    return finalizeWithFollowup(
-      finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
-      queueKey,
-      runFollowupTurn,
-    );
+      // If verbose is enabled and this is a new session, prepend a session hint.
+      let finalPayloads = guardedReplyPayloads;
+      const verboseEnabled = resolvedVerboseLevel !== "off";
+      if (autoCompactionCompleted) {
+        const count = await incrementRunCompactionCount({
+          sessionEntry: activeSessionEntry,
+          sessionStore: activeSessionStore,
+          sessionKey,
+          storePath,
+          lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
+          contextTokensUsed,
+        });
+
+        // Inject post-compaction workspace context for the next agent turn
+        if (sessionKey) {
+          const workspaceDir = process.cwd();
+          readPostCompactionContext(workspaceDir)
+            .then((contextContent) => {
+              if (contextContent) {
+                enqueueSystemEvent(contextContent, { sessionKey });
+              }
+            })
+            .catch(() => {
+              // Silent failure — post-compaction context is best-effort
+            });
+
+          // Set pending audit flag for Layer 3 (post-compaction read audit)
+          pendingPostCompactionAudits.set(sessionKey, true);
+        }
+
+        if (verboseEnabled) {
+          const suffix = typeof count === "number" ? ` (count ${count})` : "";
+          finalPayloads = [{ text: `🧹 Auto-compaction complete${suffix}.` }, ...finalPayloads];
+        }
+      }
+      if (verboseEnabled && activeIsNewSession) {
+        finalPayloads = [
+          { text: `🧭 New session: ${followupRun.run.sessionId}` },
+          ...finalPayloads,
+        ];
+      }
+      if (responseUsageLine) {
+        finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
+      }
+      const guardResult = await enforcePromptReinforcerOutputWithReport({
+        payloads: finalPayloads,
+        cfg,
+        workspaceDir: followupRun.run.workspaceDir,
+        agentDir: followupRun.run.agentDir,
+        provider: providerUsed,
+        model: modelUsed,
+        authProfileId: followupRun.run.authProfileId,
+        latestUserPrompt: followupRun.prompt,
+        usedToolNames: runResult.meta?.usedTools,
+      });
+      finalPayloads = guardResult.payloads;
+
+      if (
+        promptReinforcerLoop.enabled &&
+        guardResult.report.blocked &&
+        isRetryablePromptReinforcerReason(guardResult.report.reason) &&
+        attempt < promptReinforcerLoop.maxAttempts
+      ) {
+        lastGuardRetryReason = guardResult.report.reason;
+        defaultRuntime.error(
+          `[prompt-reinforcer] output guard retry: attempt=${attempt + 1}/${promptReinforcerLoop.maxAttempts} reason=${guardResult.report.reason}`,
+        );
+        continue;
+      }
+
+      // Post-compaction read audit (Layer 3)
+      if (sessionKey && pendingPostCompactionAudits.get(sessionKey)) {
+        pendingPostCompactionAudits.delete(sessionKey); // Delete FIRST — one-shot only
+        try {
+          const sessionFile = activeSessionEntry?.sessionFile;
+          if (sessionFile) {
+            const messages = readSessionMessages(sessionFile);
+            const readPaths = extractReadPaths(messages);
+            const workspaceDir = process.cwd();
+            const audit = auditPostCompactionReads(readPaths, workspaceDir);
+            if (!audit.passed) {
+              enqueueSystemEvent(formatAuditWarning(audit.missingPatterns), { sessionKey });
+            }
+          }
+        } catch {
+          // Silent failure — audit is best-effort
+        }
+      }
+
+      return finalizeWithFollowup(
+        finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
+        queueKey,
+        runFollowupTurn,
+      );
+    }
+    return finalizeWithFollowup(undefined, queueKey, runFollowupTurn);
   } finally {
+    followupRun.run.extraSystemPrompt = baseExtraSystemPrompt;
     blockReplyPipeline?.stop();
     typing.markRunComplete();
   }

@@ -28,6 +28,7 @@ type EmbeddedRunParams = {
 const state = vi.hoisted(() => ({
   runEmbeddedPiAgentMock: vi.fn(),
   runCliAgentMock: vi.fn(),
+  enforcePromptReinforcerOutputWithReportMock: vi.fn(),
 }));
 
 let runReplyAgentPromise:
@@ -66,6 +67,22 @@ vi.mock("../../agents/cli-runner.js", () => ({
   runCliAgent: (params: unknown) => state.runCliAgentMock(params),
 }));
 
+vi.mock("./prompt-reinforcer-output-guard.js", () => ({
+  enforcePromptReinforcerOutputWithReport: (params: unknown) =>
+    state.enforcePromptReinforcerOutputWithReportMock(params),
+  enforcePromptReinforcerOutput: async (params: unknown) => {
+    const result = await state.enforcePromptReinforcerOutputWithReportMock(params);
+    if (
+      result &&
+      typeof result === "object" &&
+      Array.isArray((result as { payloads?: unknown }).payloads)
+    ) {
+      return (result as { payloads: unknown[] }).payloads;
+    }
+    return (params as { payloads?: unknown[] })?.payloads ?? [];
+  },
+}));
+
 vi.mock("./queue.js", () => ({
   enqueueFollowupRun: vi.fn(),
   scheduleFollowupDrain: vi.fn(),
@@ -79,6 +96,13 @@ beforeAll(async () => {
 beforeEach(() => {
   state.runEmbeddedPiAgentMock.mockReset();
   state.runCliAgentMock.mockReset();
+  state.enforcePromptReinforcerOutputWithReportMock.mockReset();
+  state.enforcePromptReinforcerOutputWithReportMock.mockImplementation(
+    async (params: { payloads: unknown[] }) => ({
+      payloads: params.payloads,
+      report: { blocked: false, retryable: false },
+    }),
+  );
   vi.stubEnv("OPENCLAW_TEST_FAST", "1");
 });
 
@@ -91,6 +115,7 @@ function createMinimalRun(params?: {
   storePath?: string;
   typingMode?: TypingMode;
   blockStreamingEnabled?: boolean;
+  config?: Record<string, unknown>;
 }) {
   const typing = createMockTypingController();
   const opts = params?.opts;
@@ -110,7 +135,7 @@ function createMinimalRun(params?: {
       messageProvider: "whatsapp",
       sessionFile: "/tmp/session.jsonl",
       workspaceDir: "/tmp",
-      config: {},
+      config: params?.config ?? {},
       skillsSnapshot: {},
       provider: "anthropic",
       model: "claude",
@@ -485,6 +510,90 @@ describe("runReplyAgent typing (heartbeat)", () => {
 
     expect(typing.startTypingOnText).not.toHaveBeenCalled();
     expect(onToolResult).not.toHaveBeenCalled();
+  });
+
+  it("suppresses unchecked streaming callbacks when prompt guard is enabled", async () => {
+    const onPartialReply = vi.fn();
+    const onBlockReply = vi.fn();
+    const onToolResult = vi.fn();
+    state.runEmbeddedPiAgentMock.mockImplementationOnce(async (params: AgentRunParams) => {
+      await params.onPartialReply?.({ text: "partial" });
+      await params.onBlockReply?.({ text: "block", mediaUrls: [] });
+      await params.onToolResult?.({ text: "tool", mediaUrls: [] });
+      return { payloads: [{ text: "final" }], meta: {} };
+    });
+
+    const { run } = createMinimalRun({
+      typingMode: "message",
+      blockStreamingEnabled: true,
+      opts: { onPartialReply, onBlockReply, onToolResult },
+      config: {
+        hooks: {
+          internal: {
+            entries: {
+              "prompt-reinforcer": { enabled: true, enforceOutput: true },
+            },
+          },
+        },
+      },
+    });
+    const result = await run();
+
+    expect(onPartialReply).not.toHaveBeenCalled();
+    expect(onBlockReply).not.toHaveBeenCalled();
+    expect(onToolResult).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ text: "final" });
+  });
+
+  it("retries internally when guard blocks memory_search_required", async () => {
+    state.enforcePromptReinforcerOutputWithReportMock
+      .mockResolvedValueOnce({
+        payloads: [{ text: "hidden fail-closed" }],
+        report: {
+          blocked: true,
+          retryable: true,
+          reason: "memory_search_required",
+        },
+      })
+      .mockResolvedValueOnce({
+        payloads: [{ text: "final after retry" }],
+        report: { blocked: false, retryable: false },
+      });
+
+    state.runEmbeddedPiAgentMock
+      .mockResolvedValueOnce({
+        payloads: [{ text: "first attempt" }],
+        meta: { usedTools: [] },
+      })
+      .mockResolvedValueOnce({
+        payloads: [{ text: "second attempt" }],
+        meta: { usedTools: ["memory_search"] },
+      });
+
+    const { run } = createMinimalRun({
+      config: {
+        hooks: {
+          internal: {
+            entries: {
+              "prompt-reinforcer": {
+                enabled: true,
+                enforceOutput: true,
+                enforceMaxPasses: 3,
+              },
+            },
+          },
+        },
+      },
+    });
+    const result = await run();
+
+    expect(state.runEmbeddedPiAgentMock).toHaveBeenCalledTimes(2);
+    expect(state.enforcePromptReinforcerOutputWithReportMock).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ text: "final after retry" });
+    const secondCall = state.runEmbeddedPiAgentMock.mock.calls[1]?.[0] as
+      | { extraSystemPrompt?: string }
+      | undefined;
+    expect(secondCall?.extraSystemPrompt).toContain("MUST run memory_search first");
   });
 
   it("announces auto-compaction in verbose mode and tracks count", async () => {

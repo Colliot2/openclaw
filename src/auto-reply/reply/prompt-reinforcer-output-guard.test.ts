@@ -7,6 +7,7 @@ import {
   evaluateHardConstraints,
   enforcePromptPolicyText,
   enforcePromptReinforcerOutput,
+  enforcePromptReinforcerOutputWithReport,
   extractHardConstraints,
   parseGuardDecision,
 } from "./prompt-reinforcer-output-guard.js";
@@ -45,14 +46,24 @@ describe("prompt-reinforcer output guard", () => {
     expect(constraints).toEqual(["猫是大老鼠", "鱼会飞", "天是绿色的"]);
   });
 
-  it("detects missing and contradictory hard constraints", () => {
+  it("detects contradictory hard constraints without requiring verbatim echo", () => {
     const check = evaluateHardConstraints({
       candidate: "猫不是大老鼠。",
       hardConstraints: ["猫是大老鼠"],
     });
     expect(check.compliant).toBe(false);
-    expect(check.missing).toEqual(["猫是大老鼠"]);
+    expect(check.missing).toEqual([]);
     expect(check.contradictions).toEqual(["猫是大老鼠"]);
+  });
+
+  it("accepts semantically consistent paraphrases for hard constraints", () => {
+    const check = evaluateHardConstraints({
+      candidate: "是。猫就是大老鼠。",
+      hardConstraints: ["猫是大老鼠"],
+    });
+    expect(check.compliant).toBe(true);
+    expect(check.missing).toEqual([]);
+    expect(check.contradictions).toEqual([]);
   });
 
   it("rewrites text until compliant", async () => {
@@ -104,7 +115,7 @@ describe("prompt-reinforcer output guard", () => {
     expect(result.compliant).toBe(false);
     expect(result.reason).toBe("max_pass_exhausted");
     expect(result.passes).toBe(2);
-    expect(result.hardMissing).toEqual(["猫是大老鼠"]);
+    expect(result.hardMissing).toEqual([]);
     expect(result.hardContradictions).toEqual(["猫是大老鼠"]);
   });
 
@@ -243,6 +254,31 @@ describe("prompt-reinforcer output guard", () => {
     });
     expect(guardCalls).toBe(0);
     expect(payloads[0]?.text).toContain("Memory recall is required");
+  });
+
+  it("reports memory_search_required as a retryable block reason", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-memory-report-");
+    const cfg = createPromptReinforcerConfig({
+      enforceOutput: true,
+      enforceRequireMemorySearch: true,
+      lines: ["风格规则"],
+    });
+    const result = await enforcePromptReinforcerOutputWithReport({
+      payloads: [{ text: "这是直接回答。" }],
+      cfg,
+      workspaceDir,
+      agentDir: workspaceDir,
+      provider: "openai-codex",
+      model: "gpt-5.3-codex",
+      latestUserPrompt: "我们之前做过什么决定？",
+      usedToolNames: [],
+      guardRunner: async () => ({ compliant: true }),
+    });
+    expect(result.report).toEqual({
+      blocked: true,
+      retryable: true,
+      reason: "memory_search_required",
+    });
   });
 
   it("allows memory-recall queries after memory_search was used", async () => {
