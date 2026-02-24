@@ -50,6 +50,9 @@ export type PromptPolicyEnforceTraceEvent = {
   rewrittenChanged: boolean;
   hardMissing: string[];
   hardContradictions: string[];
+  candidateBefore: string;
+  candidateAfter: string;
+  rewrittenText?: string;
 };
 
 export type PromptPolicyEnforceOutcome = {
@@ -376,6 +379,7 @@ export async function enforcePromptPolicyText(params: {
     MAX_MAX_PASSES,
   );
   for (let pass = 1; pass <= maxPasses; pass += 1) {
+    const candidateBefore = current;
     const decision = await params.guardRunner({
       policy: params.policy,
       candidate: current,
@@ -390,6 +394,8 @@ export async function enforcePromptPolicyText(params: {
         rewrittenChanged: false,
         hardMissing: [],
         hardContradictions: [],
+        candidateBefore,
+        candidateAfter: candidateBefore,
       });
       return {
         text: current,
@@ -408,6 +414,7 @@ export async function enforcePromptPolicyText(params: {
       });
       const rewritten = decision.rewritten?.trim();
       const rewrittenChanged = Boolean(rewritten && rewritten !== current);
+      const candidateAfter = rewrittenChanged && rewritten ? rewritten : candidateBefore;
       params.onTrace?.({
         pass,
         decision: "guard_compliant",
@@ -415,6 +422,9 @@ export async function enforcePromptPolicyText(params: {
         rewrittenChanged,
         hardMissing: hardCheck.missing,
         hardContradictions: hardCheck.contradictions,
+        candidateBefore,
+        candidateAfter,
+        rewrittenText: rewritten,
       });
       if (hardCheck.compliant) {
         return {
@@ -435,6 +445,7 @@ export async function enforcePromptPolicyText(params: {
     }
     const rewritten = decision.rewritten?.trim();
     const rewrittenChanged = Boolean(rewritten && rewritten !== current);
+    const candidateAfter = rewrittenChanged && rewritten ? rewritten : candidateBefore;
     params.onTrace?.({
       pass,
       decision: "guard_rewrite",
@@ -442,6 +453,9 @@ export async function enforcePromptPolicyText(params: {
       rewrittenChanged,
       hardMissing: [],
       hardContradictions: [],
+      candidateBefore,
+      candidateAfter,
+      rewrittenText: rewritten,
     });
     if (!rewritten) {
       const hardCheck = evaluateHardConstraints({
@@ -622,6 +636,21 @@ function summarizeErrorForLog(value: unknown): string {
     return "<none>";
   }
   return summarizeTextForLog(value);
+}
+
+function logPromptReinforcerRaw(stage: string, payload: Record<string, unknown>) {
+  try {
+    defaultRuntime.log(
+      `[prompt-reinforcer][raw] ${JSON.stringify({
+        stage,
+        ...payload,
+      })}`,
+    );
+  } catch (err) {
+    defaultRuntime.error(
+      `[prompt-reinforcer][raw] log failed: stage=${stage} error=${String(err)}`,
+    );
+  }
 }
 
 function containsCjk(value: string): boolean {
@@ -843,12 +872,25 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
     const payloads = settings.failClosed
       ? params.payloads.map((payload) => withFailClosed(payload, settings.failClosedMessage))
       : params.payloads;
+    logPromptReinforcerRaw("guard_unavailable", {
+      failClosed: settings.failClosed,
+      payloads: payloads.map((payload, index) => ({
+        payload: index + 1,
+        text: typeof payload.text === "string" ? payload.text : "",
+        isError: Boolean(payload.isError),
+      })),
+    });
     return settings.failClosed
       ? blockedOutput(payloads, "guard_unavailable", false)
       : passOutput(payloads);
   }
 
   const usedTools = normalizeToolNames(params.usedToolNames);
+  logPromptReinforcerRaw("guard_input", {
+    userPrompt: params.latestUserPrompt ?? "",
+    usedTools,
+    payloadCount: params.payloads.length,
+  });
   const requiresRecall =
     settings.requireMemorySearch && requiresMemoryRecall(params.latestUserPrompt);
   const usedMemorySearch = usedTools.includes("memory_search");
@@ -856,35 +898,63 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
     defaultRuntime.error(
       `[prompt-reinforcer] output guard result: status=blocked reason=memory_search_required prompt=${summarizeTextForLog(params.latestUserPrompt ?? "")} usedTools=${usedTools.join(",") || "-"}`,
     );
-    return blockedOutput(
-      params.payloads.map((payload) => withFailClosed(payload, settings.memoryRecallFailMessage)),
-      "memory_search_required",
-      true,
+    const blockedPayloads = params.payloads.map((payload) =>
+      withFailClosed(payload, settings.memoryRecallFailMessage),
     );
+    logPromptReinforcerRaw("memory_search_block", {
+      userPrompt: params.latestUserPrompt ?? "",
+      payloads: blockedPayloads.map((payload, index) => ({
+        payload: index + 1,
+        text: typeof payload.text === "string" ? payload.text : "",
+        isError: Boolean(payload.isError),
+      })),
+    });
+    return blockedOutput(blockedPayloads, "memory_search_required", true);
   }
 
   const nextPayloads: ReplyPayload[] = [];
   let blockedByPolicy = false;
   for (const [payloadIndex, payload] of params.payloads.entries()) {
     if (payload.isError || typeof payload.text !== "string" || payload.text.trim().length === 0) {
+      logPromptReinforcerRaw("payload_skip", {
+        payload: payloadIndex + 1,
+        isError: Boolean(payload.isError),
+        hasText: typeof payload.text === "string" && payload.text.trim().length > 0,
+      });
       nextPayloads.push(payload);
       continue;
     }
+    const relevantHardConstraints = selectRelevantHardConstraints({
+      hardConstraints,
+      latestUserPrompt: params.latestUserPrompt,
+      candidate: payload.text,
+    });
+    logPromptReinforcerRaw("payload_pre", {
+      payload: payloadIndex + 1,
+      text: payload.text,
+      relevantHardConstraints,
+    });
     try {
       const outcome = await enforcePromptPolicyText({
         text: payload.text,
         policy,
         maxPasses: settings.maxPasses,
         guardRunner,
-        hardConstraints: selectRelevantHardConstraints({
-          hardConstraints,
-          latestUserPrompt: params.latestUserPrompt,
-          candidate: payload.text,
-        }),
+        hardConstraints: relevantHardConstraints,
         onTrace: (trace) => {
           defaultRuntime.log(
             `[prompt-reinforcer] output guard pass: payload=${payloadIndex + 1} pass=${trace.pass} decision=${trace.decision} rewritten=${trace.rewritten ? 1 : 0} changed=${trace.rewrittenChanged ? 1 : 0} missing=${trace.hardMissing.length} contradictions=${trace.hardContradictions.length}`,
           );
+          logPromptReinforcerRaw("pass", {
+            payload: payloadIndex + 1,
+            pass: trace.pass,
+            decision: trace.decision,
+            candidateBefore: trace.candidateBefore,
+            rewrittenText: trace.rewrittenText ?? "",
+            candidateAfter: trace.candidateAfter,
+            hardMissing: trace.hardMissing,
+            hardContradictions: trace.hardContradictions,
+          });
           if (trace.hardMissing.length > 0 || trace.hardContradictions.length > 0) {
             defaultRuntime.log(
               `[prompt-reinforcer] output guard pass details: payload=${payloadIndex + 1} pass=${trace.pass} missing=${summarizeConstraintList(trace.hardMissing)} contradictions=${summarizeConstraintList(trace.hardContradictions)}`,
@@ -896,6 +966,12 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
         defaultRuntime.log(
           `[prompt-reinforcer] output guard result: payload=${payloadIndex + 1} status=pass reason=${outcome.reason} passes=${outcome.passes} changed=${outcome.changed ? 1 : 0}`,
         );
+        logPromptReinforcerRaw("payload_post", {
+          payload: payloadIndex + 1,
+          status: "pass",
+          reason: outcome.reason,
+          text: outcome.text,
+        });
         nextPayloads.push({ ...payload, text: outcome.text });
         continue;
       }
@@ -907,17 +983,31 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
           `[prompt-reinforcer] output guard block details: payload=${payloadIndex + 1} missing=${summarizeConstraintList(outcome.hardMissing)} contradictions=${summarizeConstraintList(outcome.hardContradictions)}`,
         );
       }
-      nextPayloads.push(
-        settings.failClosed ? withFailClosed(payload, settings.failClosedMessage) : payload,
-      );
+      const blockedPayload = settings.failClosed
+        ? withFailClosed(payload, settings.failClosedMessage)
+        : payload;
+      logPromptReinforcerRaw("payload_post", {
+        payload: payloadIndex + 1,
+        status: "blocked",
+        reason: outcome.reason,
+        text: blockedPayload.text ?? "",
+      });
+      nextPayloads.push(blockedPayload);
       blockedByPolicy = blockedByPolicy || settings.failClosed;
     } catch (err) {
       defaultRuntime.error(
         `[prompt-reinforcer] output guard execution failed: payload=${payloadIndex + 1} ${String(err)}`,
       );
-      nextPayloads.push(
-        settings.failClosed ? withFailClosed(payload, settings.failClosedMessage) : payload,
-      );
+      const failedPayload = settings.failClosed
+        ? withFailClosed(payload, settings.failClosedMessage)
+        : payload;
+      logPromptReinforcerRaw("payload_post", {
+        payload: payloadIndex + 1,
+        status: "error",
+        reason: "guard_execution_failed",
+        text: failedPayload.text ?? "",
+      });
+      nextPayloads.push(failedPayload);
       blockedByPolicy = blockedByPolicy || settings.failClosed;
     }
   }

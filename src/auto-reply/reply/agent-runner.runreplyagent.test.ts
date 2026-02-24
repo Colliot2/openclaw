@@ -29,6 +29,8 @@ const state = vi.hoisted(() => ({
   runEmbeddedPiAgentMock: vi.fn(),
   runCliAgentMock: vi.fn(),
   enforcePromptReinforcerOutputWithReportMock: vi.fn(),
+  resolveMemorySearchConfigMock: vi.fn(),
+  getMemorySearchManagerMock: vi.fn(),
 }));
 
 let runReplyAgentPromise:
@@ -83,6 +85,14 @@ vi.mock("./prompt-reinforcer-output-guard.js", () => ({
   },
 }));
 
+vi.mock("../../agents/memory-search.js", () => ({
+  resolveMemorySearchConfig: (...args: unknown[]) => state.resolveMemorySearchConfigMock(...args),
+}));
+
+vi.mock("../../memory/index.js", () => ({
+  getMemorySearchManager: (...args: unknown[]) => state.getMemorySearchManagerMock(...args),
+}));
+
 vi.mock("./queue.js", () => ({
   enqueueFollowupRun: vi.fn(),
   scheduleFollowupDrain: vi.fn(),
@@ -97,12 +107,20 @@ beforeEach(() => {
   state.runEmbeddedPiAgentMock.mockReset();
   state.runCliAgentMock.mockReset();
   state.enforcePromptReinforcerOutputWithReportMock.mockReset();
+  state.resolveMemorySearchConfigMock.mockReset();
+  state.getMemorySearchManagerMock.mockReset();
   state.enforcePromptReinforcerOutputWithReportMock.mockImplementation(
     async (params: { payloads: unknown[] }) => ({
       payloads: params.payloads,
       report: { blocked: false, retryable: false },
     }),
   );
+  state.resolveMemorySearchConfigMock.mockReturnValue({ enabled: true });
+  state.getMemorySearchManagerMock.mockResolvedValue({
+    manager: {
+      search: vi.fn().mockResolvedValue([]),
+    },
+  });
   vi.stubEnv("OPENCLAW_TEST_FAST", "1");
 });
 
@@ -130,6 +148,7 @@ function createMinimalRun(params?: {
     summaryLine: "hello",
     enqueuedAt: Date.now(),
     run: {
+      agentId: "main",
       sessionId: "session",
       sessionKey,
       messageProvider: "whatsapp",
@@ -559,6 +578,20 @@ describe("runReplyAgent typing (heartbeat)", () => {
         payloads: [{ text: "final after retry" }],
         report: { blocked: false, retryable: false },
       });
+    state.getMemorySearchManagerMock.mockResolvedValueOnce({
+      manager: {
+        search: vi.fn().mockResolvedValue([
+          {
+            path: "MEMORY.md",
+            startLine: 1,
+            endLine: 1,
+            score: 0.9,
+            snippet: "日本任务在子进程中运行。",
+            source: "memory",
+          },
+        ]),
+      },
+    });
 
     state.runEmbeddedPiAgentMock
       .mockResolvedValueOnce({
@@ -567,7 +600,7 @@ describe("runReplyAgent typing (heartbeat)", () => {
       })
       .mockResolvedValueOnce({
         payloads: [{ text: "second attempt" }],
-        meta: { usedTools: ["memory_search"] },
+        meta: { usedTools: [] },
       });
 
     const { run } = createMinimalRun({
@@ -588,12 +621,58 @@ describe("runReplyAgent typing (heartbeat)", () => {
     const result = await run();
 
     expect(state.runEmbeddedPiAgentMock).toHaveBeenCalledTimes(2);
+    expect(state.getMemorySearchManagerMock).toHaveBeenCalledTimes(1);
     expect(state.enforcePromptReinforcerOutputWithReportMock).toHaveBeenCalledTimes(2);
     expect(result).toMatchObject({ text: "final after retry" });
     const secondCall = state.runEmbeddedPiAgentMock.mock.calls[1]?.[0] as
       | { extraSystemPrompt?: string }
       | undefined;
     expect(secondCall?.extraSystemPrompt).toContain("MUST run memory_search first");
+    expect(secondCall?.extraSystemPrompt).toContain("Runtime auto-prefetch executed memory_search");
+    const secondGuardCall = state.enforcePromptReinforcerOutputWithReportMock.mock.calls[1]?.[0] as
+      | { usedToolNames?: string[] }
+      | undefined;
+    expect(secondGuardCall?.usedToolNames).toContain("memory_search");
+  });
+
+  it("does not loop when memory_search_required prefetch fails", async () => {
+    state.enforcePromptReinforcerOutputWithReportMock.mockResolvedValueOnce({
+      payloads: [{ text: "blocked once" }],
+      report: {
+        blocked: true,
+        retryable: true,
+        reason: "memory_search_required",
+      },
+    });
+    state.getMemorySearchManagerMock.mockResolvedValueOnce({
+      manager: null,
+      error: "memory unavailable",
+    });
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "first attempt" }],
+      meta: { usedTools: [] },
+    });
+
+    const { run } = createMinimalRun({
+      config: {
+        hooks: {
+          internal: {
+            entries: {
+              "prompt-reinforcer": {
+                enabled: true,
+                enforceOutput: true,
+                enforceMaxPasses: 10,
+              },
+            },
+          },
+        },
+      },
+    });
+    const result = await run();
+
+    expect(state.runEmbeddedPiAgentMock).toHaveBeenCalledTimes(1);
+    expect(state.enforcePromptReinforcerOutputWithReportMock).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ text: "blocked once" });
   });
 
   it("announces auto-compaction in verbose mode and tracks count", async () => {

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import { lookupContextTokens } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
+import { resolveMemorySearchConfig } from "../../agents/memory-search.js";
 import { resolveModelAuthMode } from "../../agents/model-auth.js";
 import { isCliProvider } from "../../agents/model-selection.js";
 import { queueEmbeddedPiMessage } from "../../agents/pi-embedded.js";
@@ -19,6 +20,8 @@ import type { TypingMode } from "../../config/types.js";
 import { resolveHookConfig } from "../../hooks/config.js";
 import { emitDiagnosticEvent, isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
 import { enqueueSystemEvent } from "../../infra/system-events.js";
+import { getMemorySearchManager } from "../../memory/index.js";
+import type { MemorySearchResult } from "../../memory/types.js";
 import { PROMPT_REINFORCER_HOOK_KEY } from "../../prompt-reinforcer/policy.js";
 import { defaultRuntime } from "../../runtime.js";
 import { estimateUsageCost, resolveModelCostConfig } from "../../utils/usage-format.js";
@@ -60,6 +63,8 @@ const BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000;
 const PROMPT_REINFORCER_RETRY_DEFAULT_MAX_ATTEMPTS = 2;
 const PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS = 1;
 const PROMPT_REINFORCER_RETRY_MAX_ATTEMPTS = 10;
+const AUTO_MEMORY_PREFETCH_MAX_RESULTS = 3;
+const AUTO_MEMORY_PREFETCH_SNIPPET_MAX_CHARS = 280;
 const UNSCHEDULED_REMINDER_NOTE =
   "Note: I did not schedule a reminder in this turn, so this will not trigger automatically.";
 const REMINDER_COMMITMENT_PATTERNS: RegExp[] = [
@@ -141,6 +146,120 @@ function appendUnscheduledReminderNote(payloads: ReplyPayload[]): ReplyPayload[]
       text: `${trimmed}\n\n${UNSCHEDULED_REMINDER_NOTE}`,
     };
   });
+}
+
+function summarizeReplyPayloadsForRawLog(payloads: ReplyPayload[]) {
+  return payloads.map((payload, index) => ({
+    index: index + 1,
+    isError: Boolean(payload.isError),
+    text: typeof payload.text === "string" ? payload.text : "",
+    mediaUrl: payload.mediaUrl ?? null,
+  }));
+}
+
+function logReplyRaw(stage: string, payload: Record<string, unknown>) {
+  try {
+    defaultRuntime.log(
+      `[reply-raw] ${JSON.stringify({
+        stage,
+        ...payload,
+      })}`,
+    );
+  } catch (err) {
+    defaultRuntime.error(`[reply-raw] log failed: stage=${stage} error=${String(err)}`);
+  }
+}
+
+function compactSingleLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateChars(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  return `${value.slice(0, maxChars)}...`;
+}
+
+function formatMemoryCitation(entry: MemorySearchResult): string {
+  const linePart =
+    entry.startLine === entry.endLine
+      ? `#L${entry.startLine}`
+      : `#L${entry.startLine}-L${entry.endLine}`;
+  return `${entry.path}${linePart}`;
+}
+
+function buildAutoMemoryPrefetchPromptBlock(query: string, results: MemorySearchResult[]): string {
+  const lines: string[] = [
+    "Runtime auto-prefetch executed memory_search because output guard required memory recall in the previous attempt.",
+    `Query: ${compactSingleLine(query)}`,
+  ];
+  if (results.length === 0) {
+    lines.push("Memory search returned no matches.");
+  } else {
+    lines.push("Memory search results:");
+    for (const [index, entry] of results.entries()) {
+      const snippet = truncateChars(
+        compactSingleLine(entry.snippet ?? ""),
+        AUTO_MEMORY_PREFETCH_SNIPPET_MAX_CHARS,
+      );
+      lines.push(`${index + 1}. ${formatMemoryCitation(entry)} :: ${snippet}`);
+    }
+  }
+  lines.push(
+    "Treat this as the memory_search evidence for this turn; do not skip policy compliance.",
+  );
+  return lines.join("\n");
+}
+
+type AutoMemoryPrefetchResult = {
+  satisfied: boolean;
+  reason: "ok" | "memory_disabled" | "manager_unavailable" | "search_failed";
+  resultCount: number;
+  promptBlock?: string;
+  error?: string;
+};
+
+async function runAutoMemoryPrefetch(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  sessionKey?: string;
+  query: string;
+}): Promise<AutoMemoryPrefetchResult> {
+  if (!resolveMemorySearchConfig(params.cfg, params.agentId)) {
+    return { satisfied: false, reason: "memory_disabled", resultCount: 0 };
+  }
+  const { manager, error } = await getMemorySearchManager({
+    cfg: params.cfg,
+    agentId: params.agentId,
+  });
+  if (!manager) {
+    return {
+      satisfied: false,
+      reason: "manager_unavailable",
+      resultCount: 0,
+      error,
+    };
+  }
+  try {
+    const results = await manager.search(params.query, {
+      sessionKey: params.sessionKey,
+      maxResults: AUTO_MEMORY_PREFETCH_MAX_RESULTS,
+    });
+    return {
+      satisfied: true,
+      reason: "ok",
+      resultCount: results.length,
+      promptBlock: buildAutoMemoryPrefetchPromptBlock(params.query, results),
+    };
+  } catch (err) {
+    return {
+      satisfied: false,
+      reason: "search_failed",
+      resultCount: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 // Track sessions pending post-compaction read audit (Layer 3)
@@ -417,21 +536,38 @@ export async function runReplyAgent(params: {
     });
   const baseExtraSystemPrompt = followupRun.run.extraSystemPrompt;
   let lastGuardRetryReason: PromptReinforcerOutputBlockReason | undefined;
+  let pendingAutoMemoryPrefetch: {
+    promptBlock?: string;
+    markUsedTool: boolean;
+  } | null = null;
   try {
     for (let attempt = 1; attempt <= promptReinforcerLoop.maxAttempts; attempt += 1) {
       responseUsageLine = undefined;
+      const autoMemoryPrefetchForAttempt = pendingAutoMemoryPrefetch;
+      pendingAutoMemoryPrefetch = null;
+      const extraPromptParts: string[] = [];
+      if (baseExtraSystemPrompt && baseExtraSystemPrompt.trim()) {
+        extraPromptParts.push(baseExtraSystemPrompt);
+      }
       if (promptReinforcerLoop.enabled && lastGuardRetryReason) {
         const retryInstruction = buildPromptReinforcerRetryInstruction({
           reason: lastGuardRetryReason,
           attempt,
           maxAttempts: promptReinforcerLoop.maxAttempts,
         });
-        followupRun.run.extraSystemPrompt = [baseExtraSystemPrompt, retryInstruction]
-          .filter(Boolean)
-          .join("\n\n");
-      } else {
-        followupRun.run.extraSystemPrompt = baseExtraSystemPrompt;
+        extraPromptParts.push(retryInstruction);
       }
+      if (autoMemoryPrefetchForAttempt?.promptBlock?.trim()) {
+        extraPromptParts.push(autoMemoryPrefetchForAttempt.promptBlock.trim());
+      }
+      followupRun.run.extraSystemPrompt = extraPromptParts.join("\n\n");
+      logReplyRaw("attempt_input", {
+        attempt,
+        maxAttempts: promptReinforcerLoop.maxAttempts,
+        sessionKey: sessionKey ?? "unknown",
+        userPrompt: followupRun.prompt,
+        autoMemoryPrefetched: Boolean(autoMemoryPrefetchForAttempt),
+      });
 
       const runStartedAt = Date.now();
       const runOutcome = await runAgentTurnWithFallback({
@@ -679,6 +815,19 @@ export async function runReplyAgent(params: {
       if (responseUsageLine) {
         finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
       }
+      logReplyRaw("attempt_output_pre_guard", {
+        attempt,
+        maxAttempts: promptReinforcerLoop.maxAttempts,
+        sessionKey: sessionKey ?? "unknown",
+        payloads: summarizeReplyPayloadsForRawLog(finalPayloads),
+      });
+      const usedToolNames = [...(runResult.meta?.usedTools ?? [])];
+      if (
+        autoMemoryPrefetchForAttempt?.markUsedTool &&
+        !usedToolNames.some((name) => name === "memory_search")
+      ) {
+        usedToolNames.push("memory_search");
+      }
       const guardResult = await enforcePromptReinforcerOutputWithReport({
         payloads: finalPayloads,
         cfg,
@@ -688,9 +837,17 @@ export async function runReplyAgent(params: {
         model: modelUsed,
         authProfileId: followupRun.run.authProfileId,
         latestUserPrompt: followupRun.prompt,
-        usedToolNames: runResult.meta?.usedTools,
+        usedToolNames,
       });
       finalPayloads = guardResult.payloads;
+      logReplyRaw("attempt_output_post_guard", {
+        attempt,
+        maxAttempts: promptReinforcerLoop.maxAttempts,
+        sessionKey: sessionKey ?? "unknown",
+        blocked: guardResult.report.blocked,
+        blockReason: guardResult.report.reason ?? null,
+        payloads: summarizeReplyPayloadsForRawLog(finalPayloads),
+      });
 
       if (
         promptReinforcerLoop.enabled &&
@@ -698,6 +855,39 @@ export async function runReplyAgent(params: {
         isRetryablePromptReinforcerReason(guardResult.report.reason) &&
         attempt < promptReinforcerLoop.maxAttempts
       ) {
+        if (guardResult.report.reason === "memory_search_required") {
+          const autoMemoryPrefetch = await runAutoMemoryPrefetch({
+            cfg,
+            agentId: followupRun.run.agentId || "main",
+            sessionKey,
+            query: followupRun.prompt,
+          });
+          logReplyRaw("memory_prefetch", {
+            attempt,
+            maxAttempts: promptReinforcerLoop.maxAttempts,
+            sessionKey: sessionKey ?? "unknown",
+            satisfied: autoMemoryPrefetch.satisfied,
+            reason: autoMemoryPrefetch.reason,
+            resultCount: autoMemoryPrefetch.resultCount,
+            error: autoMemoryPrefetch.error ?? null,
+          });
+          if (autoMemoryPrefetch.satisfied) {
+            pendingAutoMemoryPrefetch = {
+              promptBlock: autoMemoryPrefetch.promptBlock,
+              markUsedTool: true,
+            };
+          } else {
+            defaultRuntime.error(
+              `[prompt-reinforcer] output guard retry aborted: reason=memory_search_required prefetch=${autoMemoryPrefetch.reason} error=${autoMemoryPrefetch.error ?? "-"}`,
+            );
+            lastGuardRetryReason = undefined;
+            return finalizeWithFollowup(
+              finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
+              queueKey,
+              runFollowupTurn,
+            );
+          }
+        }
         lastGuardRetryReason = guardResult.report.reason;
         defaultRuntime.error(
           `[prompt-reinforcer] output guard retry: attempt=${attempt + 1}/${promptReinforcerLoop.maxAttempts} reason=${guardResult.report.reason}`,
