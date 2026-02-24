@@ -6,6 +6,7 @@ import { resolveMemorySearchConfig } from "../../agents/memory-search.js";
 import { resolveModelAuthMode } from "../../agents/model-auth.js";
 import { isCliProvider } from "../../agents/model-selection.js";
 import { queueEmbeddedPiMessage } from "../../agents/pi-embedded.js";
+import { spawnSubagentDirect } from "../../agents/subagent-spawn.js";
 import { hasNonzeroUsage } from "../../agents/usage.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
@@ -95,28 +96,34 @@ type PromptReinforcerReasonRule = {
   reason: PromptReinforcerOutputBlockReason;
   policy: PromptReinforcerRetryPolicy;
   mitigation: PromptReinforcerFailureMitigation;
-  retryInstructionBuilder: (params: { attempt: number; maxAttempts: number }) => string;
+  retryInstructionBuilder: (params: {
+    attempt: number;
+    maxAttempts: number;
+    detail?: string;
+  }) => string;
 };
 
 function buildPromptReinforcerRetryInstruction(params: {
   reason: PromptReinforcerOutputBlockReason;
   attempt: number;
   maxAttempts: number;
+  detail?: string;
 }): string {
   const prefix = `Prompt policy auto-retry ${params.attempt}/${params.maxAttempts}.`;
+  const detailSuffix = params.detail?.trim() ? ` Violation detail: ${params.detail.trim()}` : "";
   if (params.reason === "memory_search_required") {
-    return `${prefix} Previous draft was blocked because memory recall was required. In this retry, you MUST run memory_search first, then answer from retrieved memory evidence.`;
+    return `${prefix} Previous draft was blocked because memory recall was required. In this retry, you MUST run memory_search first, then answer from retrieved memory evidence.${detailSuffix}`;
   }
   if (params.reason === "hard_constraints_blocked") {
-    return `${prefix} Previous draft violated hard constraints. Regenerate a response that is semantically consistent with hard constraints and contains no contradictions.`;
+    return `${prefix} Previous draft violated hard constraints. Regenerate a response that is semantically consistent with hard constraints and contains no contradictions.${detailSuffix}`;
   }
   if (params.reason === "soft_policy_blocked") {
-    return `${prefix} Previous draft violated soft policy and soft fail-open is disabled. Regenerate a soft-policy compliant response.`;
+    return `${prefix} Previous draft violated soft policy and soft fail-open is disabled. Regenerate a soft-policy compliant response.${detailSuffix}`;
   }
   if (params.reason === "guard_unavailable") {
-    return `${prefix} Guard model was unavailable in the previous attempt. Regenerate a best-effort compliant response without placeholder block text.`;
+    return `${prefix} Guard model was unavailable in the previous attempt. Regenerate a best-effort compliant response without placeholder block text.${detailSuffix}`;
   }
-  return `${prefix} Previous draft violated output policy or hard constraints. Regenerate a fully compliant response and do not emit any fail-closed placeholder text.`;
+  return `${prefix} Previous draft violated output policy or hard constraints. Regenerate a fully compliant response and do not emit any fail-closed placeholder text.${detailSuffix}`;
 }
 
 function resolvePromptReinforcerLoopSettings(cfg: OpenClawConfig): {
@@ -255,6 +262,141 @@ function appendUnscheduledReminderNote(payloads: ReplyPayload[]): ReplyPayload[]
       text: `${trimmed}\n\n${UNSCHEDULED_REMINDER_NOTE}`,
     };
   });
+}
+
+const RAW_SPAWN_COMMITMENT_RE =
+  /(任务锁定|后续.*(只发|仅发).*(进度|终稿|结果)|不达标不发|已按.*(单开|启动).*(子进程|子任务|后台任务)|(?:单开|单独进程|spawn(?:ed)?|start(?:ed)?).{0,12}(?:子进程|子任务|subagent|sub-agent|background))/i;
+const RAW_SPAWN_NEGATION_RE =
+  /(active\s+subagents\s*:\s*\(none\)|active\s*=\s*none|没有任何子进程在运行|未启动|未运行|不会启动|不启动|没人还在跑)/i;
+const RAW_SPAWN_TASK_RE = /(?:^|\n)\s*(?:[-•*]\s*)?(?:任务|task)\s*[:：]\s*`?([^`\n]+)`?/i;
+const RAW_SPAWN_LABEL_RE = /(?:^|\n)\s*(?:[-•*]\s*)?(?:任务标签|label)\s*[:：]\s*`?([^`\n]+)`?/i;
+
+type AutoSpawnExecutionPlan = {
+  task: string;
+  label?: string;
+  reason: "raw_commitment";
+};
+
+type AutoSpawnExecutionResult = {
+  notice: string;
+  spawned: boolean;
+};
+
+function hasSessionsSpawnCall(usedToolNames: string[]): boolean {
+  return usedToolNames.some((name) => name.trim().toLowerCase() === "sessions_spawn");
+}
+
+function extractTextFromReplyPayloads(payloads: ReplyPayload[]): string {
+  return payloads
+    .filter((payload) => !payload.isError && typeof payload.text === "string")
+    .map((payload) => payload.text?.trim() ?? "")
+    .filter((text) => text.length > 0)
+    .join("\n");
+}
+
+function normalizeSpawnField(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized || normalized.length < 4) {
+    return undefined;
+  }
+  return normalized;
+}
+
+function resolveAutoSpawnExecutionPlan(params: {
+  prompt: string;
+  rawReplyText: string;
+  usedToolNames: string[];
+}): AutoSpawnExecutionPlan | null {
+  if (hasSessionsSpawnCall(params.usedToolNames)) {
+    return null;
+  }
+  const raw = params.rawReplyText.trim();
+  if (!raw) {
+    return null;
+  }
+  if (RAW_SPAWN_NEGATION_RE.test(raw)) {
+    return null;
+  }
+  if (!RAW_SPAWN_COMMITMENT_RE.test(raw)) {
+    return null;
+  }
+  const task =
+    normalizeSpawnField(raw.match(RAW_SPAWN_TASK_RE)?.[1]) ?? normalizeSpawnField(params.prompt);
+  if (!task) {
+    return null;
+  }
+  const label = normalizeSpawnField(raw.match(RAW_SPAWN_LABEL_RE)?.[1]);
+  return {
+    task,
+    label,
+    reason: "raw_commitment",
+  };
+}
+
+async function autoSpawnExecutionFallback(params: {
+  plan: AutoSpawnExecutionPlan;
+  sessionKey?: string;
+  followupRun: FollowupRun;
+  sessionCtx: TemplateContext;
+}): Promise<AutoSpawnExecutionResult> {
+  if (!params.sessionKey) {
+    return {
+      notice: "检测到执行承诺，但当前会话键缺失，未能自动启动子任务。",
+      spawned: false,
+    };
+  }
+
+  const agentTo =
+    typeof params.sessionCtx.OriginatingTo === "string" && params.sessionCtx.OriginatingTo.trim()
+      ? params.sessionCtx.OriginatingTo.trim()
+      : typeof params.sessionCtx.To === "string" && params.sessionCtx.To.trim()
+        ? params.sessionCtx.To.trim()
+        : undefined;
+  const result = await spawnSubagentDirect(
+    {
+      task: params.plan.task,
+      label: params.plan.label,
+      cleanup: "keep",
+      expectsCompletionMessage: true,
+    },
+    {
+      agentSessionKey: params.sessionKey,
+      agentChannel: params.sessionCtx.OriginatingChannel,
+      agentAccountId: params.sessionCtx.AccountId,
+      agentTo,
+      agentThreadId: params.sessionCtx.MessageThreadId,
+      agentGroupId: params.followupRun.run.groupId ?? null,
+      agentGroupChannel: params.followupRun.run.groupChannel ?? null,
+      agentGroupSpace: params.followupRun.run.groupSpace ?? null,
+      requesterAgentIdOverride: params.followupRun.run.agentId || undefined,
+    },
+  );
+  const runShort = result.runId?.slice(0, 8) ?? "unknown";
+  if (result.status === "accepted") {
+    if (result.reused) {
+      if (result.reusedState === "active") {
+        return {
+          notice: `执行兜底已生效：复用已有运行中的子任务（session ${result.childSessionKey}，run ${runShort}）。`,
+          spawned: true,
+        };
+      }
+      return {
+        notice: `执行兜底已生效：命中已完成子任务（session ${result.childSessionKey}，run ${runShort}，outcome ${result.reusedOutcome ?? "unknown"}）。`,
+        spawned: true,
+      };
+    }
+    return {
+      notice: `执行兜底已生效：已自动启动子任务（session ${result.childSessionKey}，run ${runShort}）。`,
+      spawned: true,
+    };
+  }
+  return {
+    notice: `执行兜底触发但启动失败：${result.error ?? result.status}。`,
+    spawned: false,
+  };
 }
 
 function summarizeReplyPayloadsForRawLog(payloads: ReplyPayload[]) {
@@ -645,6 +787,7 @@ export async function runReplyAgent(params: {
     });
   const baseExtraSystemPrompt = followupRun.run.extraSystemPrompt;
   let lastGuardRetryReason: PromptReinforcerOutputBlockReason | undefined;
+  let lastGuardRetryDetail: string | undefined;
   let lastGuardRetryMaxAttempts = promptReinforcerLoop.maxAttempts;
   let pendingAutoMemoryPrefetch: {
     promptBlock?: string;
@@ -668,6 +811,7 @@ export async function runReplyAgent(params: {
           const retryInstruction = reasonRule.retryInstructionBuilder({
             attempt,
             maxAttempts: lastGuardRetryMaxAttempts,
+            detail: lastGuardRetryDetail,
           });
           extraPromptParts.push(retryInstruction);
         }
@@ -930,12 +1074,13 @@ export async function runReplyAgent(params: {
       if (responseUsageLine) {
         finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
       }
-      const preGuardPayloads = finalPayloads.map((payload) => ({ ...payload }));
-      logReplyRaw("attempt_output_pre_guard", {
+      const rawDraftPayloads = finalPayloads.map((payload) => ({ ...payload }));
+      const rawDraftText = extractTextFromReplyPayloads(rawDraftPayloads);
+      logReplyRaw("attempt_output_raw", {
         attempt,
         maxAttempts: promptReinforcerLoop.maxAttempts,
         sessionKey: sessionKey ?? "unknown",
-        payloads: summarizeReplyPayloadsForRawLog(finalPayloads),
+        payloads: summarizeReplyPayloadsForRawLog(rawDraftPayloads),
       });
       const usedToolNames = [...(runResult.meta?.usedTools ?? [])];
       if (
@@ -944,6 +1089,51 @@ export async function runReplyAgent(params: {
       ) {
         usedToolNames.push("memory_search");
       }
+      const spawnPlan = resolveAutoSpawnExecutionPlan({
+        prompt: followupRun.prompt,
+        rawReplyText: rawDraftText,
+        usedToolNames,
+      });
+      if (spawnPlan) {
+        try {
+          const fallback = await autoSpawnExecutionFallback({
+            plan: spawnPlan,
+            sessionKey,
+            followupRun,
+            sessionCtx,
+          });
+          if (fallback.spawned && !hasSessionsSpawnCall(usedToolNames)) {
+            usedToolNames.push("sessions_spawn");
+          }
+          if (fallback.notice.trim()) {
+            finalPayloads = [...finalPayloads, { text: fallback.notice.trim() }];
+          }
+          logReplyRaw("execution_fallback_pre_guard", {
+            attempt,
+            sessionKey: sessionKey ?? "unknown",
+            reason: spawnPlan.reason,
+            spawned: fallback.spawned,
+            notice: fallback.notice.trim(),
+          });
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          const notice = `执行兜底触发异常：${detail}`;
+          finalPayloads = [...finalPayloads, { text: notice }];
+          logReplyRaw("execution_fallback_pre_guard_error", {
+            attempt,
+            sessionKey: sessionKey ?? "unknown",
+            reason: spawnPlan.reason,
+            error: detail,
+          });
+        }
+      }
+      const preGuardPayloads = finalPayloads.map((payload) => ({ ...payload }));
+      logReplyRaw("attempt_output_pre_guard", {
+        attempt,
+        maxAttempts: promptReinforcerLoop.maxAttempts,
+        sessionKey: sessionKey ?? "unknown",
+        payloads: summarizeReplyPayloadsForRawLog(preGuardPayloads),
+      });
       const guardResult = await enforcePromptReinforcerOutputWithReport({
         payloads: finalPayloads,
         cfg,
@@ -962,6 +1152,7 @@ export async function runReplyAgent(params: {
         sessionKey: sessionKey ?? "unknown",
         blocked: guardResult.report.blocked,
         blockReason: guardResult.report.reason ?? null,
+        blockDetail: guardResult.report.detail ?? null,
         payloads: summarizeReplyPayloadsForRawLog(finalPayloads),
       });
 
@@ -1004,24 +1195,27 @@ export async function runReplyAgent(params: {
               }
             }
             lastGuardRetryReason = reason;
+            lastGuardRetryDetail = guardResult.report.detail;
             lastGuardRetryMaxAttempts = retryPolicy.maxAttempts;
             defaultRuntime.error(
-              `[prompt-reinforcer] output guard retry: attempt=${attempt + 1}/${retryPolicy.maxAttempts} reason=${reason}`,
+              `[prompt-reinforcer] output guard retry: attempt=${attempt + 1}/${retryPolicy.maxAttempts} reason=${reason} detail=${guardResult.report.detail ?? "-"}`,
             );
             continue;
           }
           if (retryPolicy.failOpen) {
             defaultRuntime.error(
-              `[prompt-reinforcer] output guard fail-open: reason=${reason ?? "unknown"} attempts=${retryPolicy.maxAttempts}`,
+              `[prompt-reinforcer] output guard fail-open: reason=${reason ?? "unknown"} detail=${guardResult.report.detail ?? "-"} attempts=${retryPolicy.maxAttempts}`,
             );
             logReplyRaw("attempt_output_fail_open", {
               attempt,
               maxAttempts: retryPolicy.maxAttempts,
               sessionKey: sessionKey ?? "unknown",
               reason: reason ?? null,
+              detail: guardResult.report.detail ?? null,
               payloads: summarizeReplyPayloadsForRawLog(preGuardPayloads),
             });
             lastGuardRetryReason = undefined;
+            lastGuardRetryDetail = undefined;
             lastGuardRetryMaxAttempts = promptReinforcerLoop.maxAttempts;
             return finalizeWithFollowup(
               preGuardPayloads.length === 1 ? preGuardPayloads[0] : preGuardPayloads,

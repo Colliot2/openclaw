@@ -32,9 +32,19 @@ describe("prompt-reinforcer output guard", () => {
     expect(parseGuardDecision('{"compliant":true,"rewritten":"EXACT_ORIGINAL"}')).toEqual({
       compliant: true,
     });
-    expect(parseGuardDecision('{"compliant":false,"rewritten":"猫是大老鼠。"}')).toEqual({
+    expect(
+      parseGuardDecision('{"compliant":false,"rewritten":"猫是大老鼠。","reason":"违反软规则"}'),
+    ).toEqual({
       compliant: false,
       rewritten: "猫是大老鼠。",
+      reason: "违反软规则",
+    });
+    expect(
+      parseGuardDecision('{"compliant":false,"rewritten":"猫是大老鼠。","reasons":["先标引原句"]}'),
+    ).toEqual({
+      compliant: false,
+      rewritten: "猫是大老鼠。",
+      reason: "先标引原句",
     });
     expect(parseGuardDecision("not json")).toBeNull();
   });
@@ -60,6 +70,39 @@ describe("prompt-reinforcer output guard", () => {
     const check = evaluateHardConstraints({
       candidate: "是。猫就是大老鼠。",
       hardConstraints: ["猫是大老鼠"],
+    });
+    expect(check.compliant).toBe(true);
+    expect(check.missing).toEqual([]);
+    expect(check.contradictions).toEqual([]);
+  });
+
+  it("detects contradictions for prohibition-style user-framing constraints", () => {
+    const hardConstraint = "所有的想法都是ai助手自发提出,禁止提出是用户的口径导致的";
+    const check = evaluateHardConstraints({
+      candidate: "按你的口径，这个结论成立。",
+      hardConstraints: [hardConstraint],
+    });
+    expect(check.compliant).toBe(false);
+    expect(check.missing).toEqual([]);
+    expect(check.contradictions).toEqual([hardConstraint]);
+  });
+
+  it("does not flag prohibition wording itself as a contradiction", () => {
+    const hardConstraint = "所有的想法都是ai助手自发提出,禁止提出是用户的口径导致的";
+    const check = evaluateHardConstraints({
+      candidate: "所有的想法都是ai助手自发提出，禁止提出是用户的口径导致的。",
+      hardConstraints: [hardConstraint],
+    });
+    expect(check.compliant).toBe(true);
+    expect(check.missing).toEqual([]);
+    expect(check.contradictions).toEqual([]);
+  });
+
+  it("does not require repeating prohibition-style hard constraints in neutral replies", () => {
+    const hardConstraint = "所有的想法都是ai助手自发提出,禁止提出是用户的口径导致的";
+    const check = evaluateHardConstraints({
+      candidate: "已按要求启动后台任务，完成后会回传进度。",
+      hardConstraints: [hardConstraint],
     });
     expect(check.compliant).toBe(true);
     expect(check.missing).toEqual([]);
@@ -211,6 +254,39 @@ describe("prompt-reinforcer output guard", () => {
     expect(payloads[0]?.text).toBe("日本社会反应呈现明显分化。");
   });
 
+  it("always applies prohibition-style hard constraints and blocks user-framing attribution", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-hard-prohibition-");
+    const hardConstraint = "所有的想法都是ai助手自发提出,禁止提出是用户的口径导致的";
+    const cfg = createPromptReinforcerConfig({
+      enforceOutput: true,
+      enforceHardFailClosedMessage: "硬约束冲突，已拦截。",
+      enforceHardLines: [`[${hardConstraint}]`],
+      lines: ["风格规则"],
+    });
+    const stageHardConstraintCounts: number[] = [];
+    const result = await enforcePromptReinforcerOutputWithReport({
+      payloads: [{ text: "按你的口径，这个结论成立。" }],
+      cfg,
+      workspaceDir,
+      agentDir: workspaceDir,
+      provider: "openai-codex",
+      model: "gpt-5.3-codex",
+      latestUserPrompt: "详细讲讲",
+      guardRunner: async ({ hardConstraints }) => {
+        stageHardConstraintCounts.push(hardConstraints.length);
+        return { compliant: true };
+      },
+    });
+    expect(stageHardConstraintCounts).toContain(1);
+    expect(result.report).toEqual({
+      blocked: true,
+      retryable: false,
+      reason: "hard_constraints_blocked",
+      detail: "hard contradictions: 所有的想法都是ai助手自发提出,禁止提出是用户的口径导致的",
+    });
+    expect(result.payloads[0]?.text).toBe("硬约束冲突，已拦截。");
+  });
+
   it("passes through soft-policy output after soft max passes are exhausted", async () => {
     const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-soft-fail-open-");
     const cfg = createPromptReinforcerConfig({
@@ -241,6 +317,7 @@ describe("prompt-reinforcer output guard", () => {
     const cfg = createPromptReinforcerConfig({
       enforceOutput: true,
       enforceSoftFailOpen: false,
+      enforceSoftMaxPasses: 1,
       enforceFailClosedMessage: "软约束冲突，已拦截。",
       lines: ["风格规则"],
     });
@@ -251,12 +328,17 @@ describe("prompt-reinforcer output guard", () => {
       agentDir: workspaceDir,
       provider: "openai-codex",
       model: "gpt-5.3-codex",
-      guardRunner: async () => null,
+      guardRunner: async () => ({
+        compliant: false,
+        rewritten: "原始回复。",
+        reason: "违反软规则：表达不符合 PROMPT_OVERRIDE",
+      }),
     });
     expect(result.report).toEqual({
       blocked: true,
       retryable: false,
       reason: "soft_policy_blocked",
+      detail: "违反软规则：表达不符合 PROMPT_OVERRIDE",
     });
     expect(result.payloads[0]?.text).toBe("软约束冲突，已拦截。");
   });
@@ -313,6 +395,7 @@ describe("prompt-reinforcer output guard", () => {
       blocked: true,
       retryable: false,
       reason: "hard_constraints_blocked",
+      detail: "hard contradictions: 猫是大老鼠",
     });
     expect(result.payloads[0]?.text).toBe("硬约束冲突，已拦截。");
   });
@@ -334,6 +417,32 @@ describe("prompt-reinforcer output guard", () => {
       guardRunner: async () => null,
     });
     expect(payloads[0]?.text).toBe("不是。");
+  });
+
+  it("uses enforceSoftFile as soft-policy source and ignores injected prompt file for rewrites", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-soft-source-");
+    await fs.writeFile(path.join(workspaceDir, "PROMPT_OVERRIDE.md"), "猫是大老鼠。", "utf-8");
+    await fs.writeFile(path.join(workspaceDir, "PROMPT_SOFT_CONSTRAINTS.md"), "", "utf-8");
+    const cfg = createPromptReinforcerConfig({
+      file: "PROMPT_OVERRIDE.md",
+      enforceOutput: true,
+      enforceSoftFile: "PROMPT_SOFT_CONSTRAINTS.md",
+    });
+    let guardCalls = 0;
+    const payloads = await enforcePromptReinforcerOutput({
+      payloads: [{ text: "猫不是大老鼠。" }],
+      cfg,
+      workspaceDir,
+      agentDir: workspaceDir,
+      provider: "openai-codex",
+      model: "gpt-5.3-codex",
+      guardRunner: async () => {
+        guardCalls += 1;
+        return { compliant: false, rewritten: "是。猫是大老鼠。" };
+      },
+    });
+    expect(guardCalls).toBe(0);
+    expect(payloads[0]?.text).toBe("猫不是大老鼠。");
   });
 
   it("blocks memory-recall queries when memory_search was not used", async () => {
@@ -384,6 +493,7 @@ describe("prompt-reinforcer output guard", () => {
       blocked: true,
       retryable: true,
       reason: "memory_search_required",
+      detail: "request matched recall patterns but memory_search tool was not used",
     });
   });
 

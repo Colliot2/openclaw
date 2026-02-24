@@ -31,6 +31,7 @@ const state = vi.hoisted(() => ({
   enforcePromptReinforcerOutputWithReportMock: vi.fn(),
   resolveMemorySearchConfigMock: vi.fn(),
   getMemorySearchManagerMock: vi.fn(),
+  spawnSubagentDirectMock: vi.fn(),
 }));
 
 let runReplyAgentPromise:
@@ -89,6 +90,14 @@ vi.mock("../../agents/memory-search.js", () => ({
   resolveMemorySearchConfig: (...args: unknown[]) => state.resolveMemorySearchConfigMock(...args),
 }));
 
+vi.mock("../../agents/subagent-spawn.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../agents/subagent-spawn.js")>();
+  return {
+    ...actual,
+    spawnSubagentDirect: (...args: unknown[]) => state.spawnSubagentDirectMock(...args),
+  };
+});
+
 vi.mock("../../memory/index.js", () => ({
   getMemorySearchManager: (...args: unknown[]) => state.getMemorySearchManagerMock(...args),
 }));
@@ -109,6 +118,7 @@ beforeEach(() => {
   state.enforcePromptReinforcerOutputWithReportMock.mockReset();
   state.resolveMemorySearchConfigMock.mockReset();
   state.getMemorySearchManagerMock.mockReset();
+  state.spawnSubagentDirectMock.mockReset();
   state.enforcePromptReinforcerOutputWithReportMock.mockImplementation(
     async (params: { payloads: unknown[] }) => ({
       payloads: params.payloads,
@@ -120,6 +130,12 @@ beforeEach(() => {
     manager: {
       search: vi.fn().mockResolvedValue([]),
     },
+  });
+  state.spawnSubagentDirectMock.mockResolvedValue({
+    status: "accepted",
+    childSessionKey: "agent:main:subagent:auto-run",
+    runId: "run-auto-1",
+    modelApplied: true,
   });
   vi.stubEnv("OPENCLAW_TEST_FAST", "1");
 });
@@ -134,6 +150,8 @@ function createMinimalRun(params?: {
   typingMode?: TypingMode;
   blockStreamingEnabled?: boolean;
   config?: Record<string, unknown>;
+  prompt?: string;
+  commandBody?: string;
 }) {
   const typing = createMockTypingController();
   const opts = params?.opts;
@@ -144,8 +162,8 @@ function createMinimalRun(params?: {
   const resolvedQueue = { mode: "interrupt" } as unknown as QueueSettings;
   const sessionKey = params?.sessionKey ?? "main";
   const followupRun = {
-    prompt: "hello",
-    summaryLine: "hello",
+    prompt: params?.prompt ?? "hello",
+    summaryLine: params?.prompt ?? "hello",
     enqueuedAt: Date.now(),
     run: {
       agentId: "main",
@@ -177,7 +195,7 @@ function createMinimalRun(params?: {
     run: async () => {
       const runReplyAgent = await getRunReplyAgent();
       return runReplyAgent({
-        commandBody: "hello",
+        commandBody: params?.commandBody ?? params?.prompt ?? "hello",
         followupRun,
         queueKey: "main",
         resolvedQueue,
@@ -633,6 +651,132 @@ describe("runReplyAgent typing (heartbeat)", () => {
       | { usedToolNames?: string[] }
       | undefined;
     expect(secondGuardCall?.usedToolNames).toContain("memory_search");
+  });
+
+  it("auto-spawns execution fallback for heavy collection prompts when sessions_spawn was not used", async () => {
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "收到，任务锁定，后续只发进度。" }],
+      meta: { usedTools: [] },
+    });
+
+    const { run } = createMinimalRun({
+      prompt: "日本社会反应深挖，必须收集日文一手原文+中文翻译，至少100篇报道和1000条评论。",
+    });
+    const result = await run();
+    const merged = Array.isArray(result)
+      ? result.map((item) => item.text ?? "").join("\n")
+      : result?.text;
+
+    expect(state.spawnSubagentDirectMock).toHaveBeenCalledTimes(1);
+    const guardCall = state.enforcePromptReinforcerOutputWithReportMock.mock.calls[0]?.[0] as
+      | { usedToolNames?: string[] }
+      | undefined;
+    expect(guardCall?.usedToolNames).toContain("sessions_spawn");
+    expect(String(merged ?? "")).toContain("执行兜底已生效");
+    expect(String(merged ?? "")).toContain("run run-auto");
+  });
+
+  it("uses raw draft before guard rewrite to trigger execution fallback", async () => {
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "收到，任务锁定为这一个，后续我只发达标计数进度与终稿。" }],
+      meta: { usedTools: [] },
+    });
+    state.enforcePromptReinforcerOutputWithReportMock.mockImplementationOnce(
+      async (params: { usedToolNames?: string[] }) => ({
+        payloads: [{ text: "guard rewritten output" }],
+        report: { blocked: false, retryable: false, usedToolNames: params.usedToolNames ?? [] },
+      }),
+    );
+
+    const { run } = createMinimalRun({
+      prompt: "日本社会反应深挖，必须收集日文一手原文+中文翻译，至少100篇报道和1000条评论。",
+    });
+    const result = await run();
+
+    expect(state.spawnSubagentDirectMock).toHaveBeenCalledTimes(1);
+    const guardCall = state.enforcePromptReinforcerOutputWithReportMock.mock.calls[0]?.[0] as
+      | { usedToolNames?: string[] }
+      | undefined;
+    expect(guardCall?.usedToolNames).toContain("sessions_spawn");
+    expect(result).toMatchObject({ text: "guard rewritten output" });
+  });
+
+  it("does not auto-spawn when only guard rewrite introduces async commitment", async () => {
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "这条先给你结论，不开后台任务。" }],
+      meta: { usedTools: [] },
+    });
+    state.enforcePromptReinforcerOutputWithReportMock.mockImplementationOnce(async () => ({
+      payloads: [{ text: "收到，任务锁定，后续只发进度。" }],
+      report: { blocked: false, retryable: false },
+    }));
+
+    const { run } = createMinimalRun({
+      prompt: "请汇总这段新闻并给出要点。",
+    });
+    const result = await run();
+
+    expect(state.spawnSubagentDirectMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ text: "收到，任务锁定，后续只发进度。" });
+  });
+
+  it("uses task and label parsed from raw draft when auto-spawning", async () => {
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [
+        {
+          text: [
+            "收到，按要求单开子进程。",
+            "- 任务标签：`jp-reaction-verified-rerun`",
+            "- 任务：`收集日文原文并输出中文对照，分层并标注证实状态`",
+          ].join("\n"),
+        },
+      ],
+      meta: { usedTools: [] },
+    });
+
+    const { run } = createMinimalRun({
+      prompt: "日本反应深挖并结构化输出。",
+    });
+    await run();
+
+    expect(state.spawnSubagentDirectMock).toHaveBeenCalledTimes(1);
+    const call = state.spawnSubagentDirectMock.mock.calls[0] as
+      | [{ task?: string; label?: string }]
+      | undefined;
+    expect(call?.[0]?.task).toBe("收集日文原文并输出中文对照，分层并标注证实状态");
+    expect(call?.[0]?.label).toBe("jp-reaction-verified-rerun");
+  });
+
+  it("does not auto-spawn fallback when raw draft has no async commitment", async () => {
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "先给你结论：目前没有看到可靠的一手样本。" }],
+      meta: { usedTools: [] },
+    });
+
+    const { run } = createMinimalRun({
+      prompt: "日本社会反应深挖，必须收集日文一手原文+中文翻译，至少100篇报道和1000条评论。",
+    });
+    await run();
+
+    expect(state.spawnSubagentDirectMock).not.toHaveBeenCalled();
+  });
+
+  it("does not auto-spawn fallback when sessions_spawn was already used", async () => {
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "已启动子任务。" }],
+      meta: { usedTools: ["sessions_spawn"] },
+    });
+
+    const { run } = createMinimalRun({
+      prompt: "日本社会反应深挖，必须收集日文一手原文+中文翻译，至少100篇报道和1000条评论。",
+    });
+    const result = await run();
+    const merged = Array.isArray(result)
+      ? result.map((item) => item.text ?? "").join("\n")
+      : result?.text;
+
+    expect(state.spawnSubagentDirectMock).not.toHaveBeenCalled();
+    expect(String(merged ?? "")).not.toContain("执行兜底已生效");
   });
 
   it("fails open after memory_search_required retries are exhausted", async () => {
