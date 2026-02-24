@@ -747,6 +747,36 @@ describe("runReplyAgent typing (heartbeat)", () => {
     expect(call?.[0]?.label).toBe("jp-reaction-verified-rerun");
   });
 
+  it("auto-spawns for progress commitment replies with counters and no final delivery", async () => {
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [
+        {
+          text: [
+            "收到，按你这条作为唯一验收标准执行，不改口径：",
+            "",
+            "当前达标计数：",
+            "- 已证实报道：0/100",
+            "- 已证实评论：0/1000",
+            "",
+            "在达到门槛前，不交付终稿。",
+          ].join("\n"),
+        },
+      ],
+      meta: { usedTools: [] },
+    });
+
+    const { run } = createMinimalRun({
+      prompt: "日本社会反应深挖，必须收集日文一手原文+中文翻译，至少100篇报道和1000条评论。",
+    });
+    await run();
+
+    expect(state.spawnSubagentDirectMock).toHaveBeenCalledTimes(1);
+    const call = state.spawnSubagentDirectMock.mock.calls[0] as
+      | [{ task?: string; label?: string }]
+      | undefined;
+    expect(call?.[0]?.task).toContain("日本社会反应深挖");
+  });
+
   it("does not auto-spawn fallback when raw draft has no async commitment", async () => {
     state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
       payloads: [{ text: "先给你结论：目前没有看到可靠的一手样本。" }],

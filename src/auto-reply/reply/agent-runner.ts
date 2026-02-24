@@ -266,6 +266,8 @@ function appendUnscheduledReminderNote(payloads: ReplyPayload[]): ReplyPayload[]
 
 const RAW_SPAWN_COMMITMENT_RE =
   /(任务锁定|后续.*(只发|仅发).*(进度|终稿|结果)|不达标不发|已按.*(单开|启动).*(子进程|子任务|后台任务)|(?:单开|单独进程|spawn(?:ed)?|start(?:ed)?).{0,12}(?:子进程|子任务|subagent|sub-agent|background))/i;
+const RAW_PROGRESS_COMMITMENT_RE =
+  /(当前达标计数|已证实报道\s*[:：]\s*\d+\s*\/\s*\d+|已证实评论\s*[:：]\s*\d+\s*\/\s*\d+|在达到门槛前.*(?:不交付|不提供).*(?:终稿|结果))/i;
 const RAW_SPAWN_NEGATION_RE =
   /(active\s+subagents\s*:\s*\(none\)|active\s*=\s*none|没有任何子进程在运行|未启动|未运行|不会启动|不启动|没人还在跑)/i;
 const RAW_SPAWN_TASK_RE = /(?:^|\n)\s*(?:[-•*]\s*)?(?:任务|task)\s*[:：]\s*`?([^`\n]+)`?/i;
@@ -274,7 +276,7 @@ const RAW_SPAWN_LABEL_RE = /(?:^|\n)\s*(?:[-•*]\s*)?(?:任务标签|label)\s*[
 type AutoSpawnExecutionPlan = {
   task: string;
   label?: string;
-  reason: "raw_commitment";
+  reason: "raw_commitment" | "progress_commitment";
 };
 
 type AutoSpawnExecutionResult = {
@@ -320,7 +322,9 @@ function resolveAutoSpawnExecutionPlan(params: {
   if (RAW_SPAWN_NEGATION_RE.test(raw)) {
     return null;
   }
-  if (!RAW_SPAWN_COMMITMENT_RE.test(raw)) {
+  const matchedSpawnCommitment = RAW_SPAWN_COMMITMENT_RE.test(raw);
+  const matchedProgressCommitment = RAW_PROGRESS_COMMITMENT_RE.test(raw);
+  if (!matchedSpawnCommitment && !matchedProgressCommitment) {
     return null;
   }
   const task =
@@ -332,7 +336,7 @@ function resolveAutoSpawnExecutionPlan(params: {
   return {
     task,
     label,
-    reason: "raw_commitment",
+    reason: matchedSpawnCommitment ? "raw_commitment" : "progress_commitment",
   };
 }
 
