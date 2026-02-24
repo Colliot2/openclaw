@@ -157,11 +157,12 @@ describe("prompt-reinforcer output guard", () => {
     expect(payloads[0]?.text).toBe("是，猫是大老鼠。");
   });
 
-  it("caps rewrite attempts to configured max passes", async () => {
+  it("caps hard-constraint rewrite attempts and blocks after hard max passes", async () => {
     const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-max-pass-");
     const cfg = createPromptReinforcerConfig({
       enforceOutput: true,
-      enforceMaxPasses: 10,
+      enforceSoftMaxPasses: 3,
+      enforceHardMaxPasses: 10,
       enforceFailClosed: true,
       enforceFailClosedMessage: "策略冲突，已拦截。",
       enforceHardLines: ["[猫是大老鼠]"],
@@ -180,7 +181,7 @@ describe("prompt-reinforcer output guard", () => {
         return { compliant: true };
       },
     });
-    expect(calls).toBe(10);
+    expect(calls).toBe(11);
     expect(payloads[0]?.text).toBe("策略冲突，已拦截。");
   });
 
@@ -210,13 +211,12 @@ describe("prompt-reinforcer output guard", () => {
     expect(payloads[0]?.text).toBe("日本社会反应呈现明显分化。");
   });
 
-  it("does not pass changed-but-noncompliant output", async () => {
-    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-noncompliant-");
+  it("passes through soft-policy output after soft max passes are exhausted", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-soft-fail-open-");
     const cfg = createPromptReinforcerConfig({
       enforceOutput: true,
-      enforceMaxPasses: 2,
-      enforceFailClosed: true,
-      enforceFailClosedMessage: "策略冲突，已拦截。",
+      enforceSoftMaxPasses: 2,
+      enforceSoftFailOpen: true,
       lines: ["风格规则"],
     });
     let calls = 0;
@@ -233,7 +233,32 @@ describe("prompt-reinforcer output guard", () => {
       },
     });
     expect(calls).toBe(2);
-    expect(payloads[0]?.text).toBe("策略冲突，已拦截。");
+    expect(payloads[0]?.text).toBe("已改写但仍不合规。");
+  });
+
+  it("reports soft_policy_blocked when soft fail-open is disabled", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-soft-block-");
+    const cfg = createPromptReinforcerConfig({
+      enforceOutput: true,
+      enforceSoftFailOpen: false,
+      enforceFailClosedMessage: "软约束冲突，已拦截。",
+      lines: ["风格规则"],
+    });
+    const result = await enforcePromptReinforcerOutputWithReport({
+      payloads: [{ text: "原始回复。" }],
+      cfg,
+      workspaceDir,
+      agentDir: workspaceDir,
+      provider: "openai-codex",
+      model: "gpt-5.3-codex",
+      guardRunner: async () => null,
+    });
+    expect(result.report).toEqual({
+      blocked: true,
+      retryable: false,
+      reason: "soft_policy_blocked",
+    });
+    expect(result.payloads[0]?.text).toBe("软约束冲突，已拦截。");
   });
 
   it("loads hard constraints from explicit hard file", async () => {
@@ -262,12 +287,41 @@ describe("prompt-reinforcer output guard", () => {
     expect(payloads[0]?.text).toBe("硬约束冲突，已拦截。");
   });
 
-  it("fails closed when guard cannot return a decision", async () => {
-    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-output-fail-closed-");
+  it("reports hard_constraints_blocked when hard constraints remain unresolved", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-hard-block-");
     const cfg = createPromptReinforcerConfig({
       enforceOutput: true,
-      enforceFailClosed: true,
-      enforceFailClosedMessage: "策略冲突，已拦截。",
+      enforceHardFile: "PROMPT_HARD_CONSTRAINTS.md",
+      enforceHardFailClosedMessage: "硬约束冲突，已拦截。",
+      lines: ["风格规则"],
+    });
+    await fs.writeFile(
+      path.join(workspaceDir, "PROMPT_HARD_CONSTRAINTS.md"),
+      "[猫是大老鼠]\n",
+      "utf-8",
+    );
+    const result = await enforcePromptReinforcerOutputWithReport({
+      payloads: [{ text: "猫不是大老鼠。" }],
+      cfg,
+      workspaceDir,
+      agentDir: workspaceDir,
+      provider: "openai-codex",
+      model: "gpt-5.3-codex",
+      guardRunner: async () => ({ compliant: true }),
+    });
+    expect(result.report).toEqual({
+      blocked: true,
+      retryable: false,
+      reason: "hard_constraints_blocked",
+    });
+    expect(result.payloads[0]?.text).toBe("硬约束冲突，已拦截。");
+  });
+
+  it("passes through soft-policy output when guard cannot return a decision", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-output-fail-open-");
+    const cfg = createPromptReinforcerConfig({
+      enforceOutput: true,
+      enforceSoftFailOpen: true,
       lines: ["猫是大老鼠。"],
     });
     const payloads = await enforcePromptReinforcerOutput({
@@ -279,7 +333,7 @@ describe("prompt-reinforcer output guard", () => {
       model: "gpt-5.3-codex",
       guardRunner: async () => null,
     });
-    expect(payloads[0]?.text).toBe("策略冲突，已拦截。");
+    expect(payloads[0]?.text).toBe("不是。");
   });
 
   it("blocks memory-recall queries when memory_search was not used", async () => {

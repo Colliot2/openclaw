@@ -635,21 +635,73 @@ describe("runReplyAgent typing (heartbeat)", () => {
     expect(secondGuardCall?.usedToolNames).toContain("memory_search");
   });
 
-  it("does not loop when memory_search_required prefetch fails", async () => {
-    state.enforcePromptReinforcerOutputWithReportMock.mockResolvedValueOnce({
-      payloads: [{ text: "blocked once" }],
-      report: {
-        blocked: true,
-        retryable: true,
-        reason: "memory_search_required",
-      },
-    });
+  it("fails open after memory_search_required retries are exhausted", async () => {
+    state.enforcePromptReinforcerOutputWithReportMock
+      .mockResolvedValueOnce({
+        payloads: [{ text: "blocked once" }],
+        report: {
+          blocked: true,
+          retryable: true,
+          reason: "memory_search_required",
+        },
+      })
+      .mockResolvedValueOnce({
+        payloads: [{ text: "blocked twice" }],
+        report: {
+          blocked: true,
+          retryable: true,
+          reason: "memory_search_required",
+        },
+      });
     state.getMemorySearchManagerMock.mockResolvedValueOnce({
       manager: null,
       error: "memory unavailable",
     });
+    state.runEmbeddedPiAgentMock
+      .mockResolvedValueOnce({
+        payloads: [{ text: "first attempt" }],
+        meta: { usedTools: [] },
+      })
+      .mockResolvedValueOnce({
+        payloads: [{ text: "second attempt" }],
+        meta: { usedTools: [] },
+      });
+
+    const { run } = createMinimalRun({
+      config: {
+        hooks: {
+          internal: {
+            entries: {
+              "prompt-reinforcer": {
+                enabled: true,
+                enforceOutput: true,
+                enforceMemoryRetryMaxAttempts: 2,
+                enforceMemoryRetryFailOpen: true,
+              },
+            },
+          },
+        },
+      },
+    });
+    const result = await run();
+
+    expect(state.runEmbeddedPiAgentMock).toHaveBeenCalledTimes(2);
+    expect(state.enforcePromptReinforcerOutputWithReportMock).toHaveBeenCalledTimes(2);
+    expect(state.getMemorySearchManagerMock).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ text: "second attempt" });
+  });
+
+  it("does not retry hard_constraints_blocked by default", async () => {
+    state.enforcePromptReinforcerOutputWithReportMock.mockResolvedValueOnce({
+      payloads: [{ text: "hard blocked" }],
+      report: {
+        blocked: true,
+        retryable: false,
+        reason: "hard_constraints_blocked",
+      },
+    });
     state.runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      payloads: [{ text: "first attempt" }],
+      payloads: [{ text: "attempt one" }],
       meta: { usedTools: [] },
     });
 
@@ -661,7 +713,6 @@ describe("runReplyAgent typing (heartbeat)", () => {
               "prompt-reinforcer": {
                 enabled: true,
                 enforceOutput: true,
-                enforceMaxPasses: 10,
               },
             },
           },
@@ -672,7 +723,7 @@ describe("runReplyAgent typing (heartbeat)", () => {
 
     expect(state.runEmbeddedPiAgentMock).toHaveBeenCalledTimes(1);
     expect(state.enforcePromptReinforcerOutputWithReportMock).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ text: "blocked once" });
+    expect(result).toMatchObject({ text: "hard blocked" });
   });
 
   it("announces auto-compaction in verbose mode and tracks count", async () => {

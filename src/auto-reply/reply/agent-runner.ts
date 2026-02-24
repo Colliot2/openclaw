@@ -63,6 +63,7 @@ const BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000;
 const PROMPT_REINFORCER_RETRY_DEFAULT_MAX_ATTEMPTS = 2;
 const PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS = 1;
 const PROMPT_REINFORCER_RETRY_MAX_ATTEMPTS = 10;
+const PROMPT_REINFORCER_POLICY_RETRY_DEFAULT_MAX_ATTEMPTS = 1;
 const AUTO_MEMORY_PREFETCH_MAX_RESULTS = 3;
 const AUTO_MEMORY_PREFETCH_SNIPPET_MAX_CHARS = 280;
 const UNSCHEDULED_REMINDER_NOTE =
@@ -83,29 +84,19 @@ function clampPromptReinforcerAttempts(value: unknown): number {
   );
 }
 
-function resolvePromptReinforcerLoopSettings(cfg: OpenClawConfig): {
-  enabled: boolean;
+type PromptReinforcerRetryPolicy = {
   maxAttempts: number;
-} {
-  const hookConfig = resolveHookConfig(cfg, PROMPT_REINFORCER_HOOK_KEY);
-  if (!hookConfig || hookConfig.enabled === false) {
-    return { enabled: false, maxAttempts: PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS };
-  }
-  const raw = hookConfig as Record<string, unknown>;
-  const enabled = raw.enforceOutput === true;
-  return {
-    enabled,
-    maxAttempts: enabled
-      ? clampPromptReinforcerAttempts(raw.enforceMaxPasses)
-      : PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS,
-  };
-}
+  failOpen: boolean;
+};
 
-function isRetryablePromptReinforcerReason(
-  reason: PromptReinforcerOutputBlockReason | undefined,
-): boolean {
-  return reason === "memory_search_required" || reason === "policy_guard_blocked";
-}
+type PromptReinforcerFailureMitigation = "none" | "auto_memory_prefetch";
+
+type PromptReinforcerReasonRule = {
+  reason: PromptReinforcerOutputBlockReason;
+  policy: PromptReinforcerRetryPolicy;
+  mitigation: PromptReinforcerFailureMitigation;
+  retryInstructionBuilder: (params: { attempt: number; maxAttempts: number }) => string;
+};
 
 function buildPromptReinforcerRetryInstruction(params: {
   reason: PromptReinforcerOutputBlockReason;
@@ -116,7 +107,125 @@ function buildPromptReinforcerRetryInstruction(params: {
   if (params.reason === "memory_search_required") {
     return `${prefix} Previous draft was blocked because memory recall was required. In this retry, you MUST run memory_search first, then answer from retrieved memory evidence.`;
   }
+  if (params.reason === "hard_constraints_blocked") {
+    return `${prefix} Previous draft violated hard constraints. Regenerate a response that is semantically consistent with hard constraints and contains no contradictions.`;
+  }
+  if (params.reason === "soft_policy_blocked") {
+    return `${prefix} Previous draft violated soft policy and soft fail-open is disabled. Regenerate a soft-policy compliant response.`;
+  }
+  if (params.reason === "guard_unavailable") {
+    return `${prefix} Guard model was unavailable in the previous attempt. Regenerate a best-effort compliant response without placeholder block text.`;
+  }
   return `${prefix} Previous draft violated output policy or hard constraints. Regenerate a fully compliant response and do not emit any fail-closed placeholder text.`;
+}
+
+function resolvePromptReinforcerLoopSettings(cfg: OpenClawConfig): {
+  enabled: boolean;
+  maxAttempts: number;
+  rules: Partial<Record<PromptReinforcerOutputBlockReason, PromptReinforcerReasonRule>>;
+} {
+  const hookConfig = resolveHookConfig(cfg, PROMPT_REINFORCER_HOOK_KEY);
+  if (!hookConfig || hookConfig.enabled === false) {
+    return {
+      enabled: false,
+      maxAttempts: PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS,
+      rules: {},
+    };
+  }
+  const raw = hookConfig as Record<string, unknown>;
+  const enabled = raw.enforceOutput === true;
+  const memoryPolicy: PromptReinforcerRetryPolicy = {
+    maxAttempts: clampPromptReinforcerAttempts(raw.enforceMemoryRetryMaxAttempts),
+    failOpen: raw.enforceMemoryRetryFailOpen !== false,
+  };
+  const policyPolicy: PromptReinforcerRetryPolicy = {
+    maxAttempts: clampPromptReinforcerAttempts(
+      raw.enforcePolicyRetryMaxAttempts ?? PROMPT_REINFORCER_POLICY_RETRY_DEFAULT_MAX_ATTEMPTS,
+    ),
+    failOpen: raw.enforcePolicyRetryFailOpen === true,
+  };
+  const rules: Partial<Record<PromptReinforcerOutputBlockReason, PromptReinforcerReasonRule>> = {
+    memory_search_required: {
+      reason: "memory_search_required",
+      policy: memoryPolicy,
+      mitigation: "auto_memory_prefetch",
+      retryInstructionBuilder: ({ attempt, maxAttempts }) =>
+        buildPromptReinforcerRetryInstruction({
+          reason: "memory_search_required",
+          attempt,
+          maxAttempts,
+        }),
+    },
+    soft_policy_blocked: {
+      reason: "soft_policy_blocked",
+      policy: policyPolicy,
+      mitigation: "none",
+      retryInstructionBuilder: ({ attempt, maxAttempts }) =>
+        buildPromptReinforcerRetryInstruction({
+          reason: "soft_policy_blocked",
+          attempt,
+          maxAttempts,
+        }),
+    },
+    hard_constraints_blocked: {
+      reason: "hard_constraints_blocked",
+      policy: policyPolicy,
+      mitigation: "none",
+      retryInstructionBuilder: ({ attempt, maxAttempts }) =>
+        buildPromptReinforcerRetryInstruction({
+          reason: "hard_constraints_blocked",
+          attempt,
+          maxAttempts,
+        }),
+    },
+    policy_guard_blocked: {
+      reason: "policy_guard_blocked",
+      policy: policyPolicy,
+      mitigation: "none",
+      retryInstructionBuilder: ({ attempt, maxAttempts }) =>
+        buildPromptReinforcerRetryInstruction({
+          reason: "policy_guard_blocked",
+          attempt,
+          maxAttempts,
+        }),
+    },
+    guard_unavailable: {
+      reason: "guard_unavailable",
+      policy: {
+        maxAttempts: PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS,
+        failOpen: false,
+      },
+      mitigation: "none",
+      retryInstructionBuilder: ({ attempt, maxAttempts }) =>
+        buildPromptReinforcerRetryInstruction({
+          reason: "guard_unavailable",
+          attempt,
+          maxAttempts,
+        }),
+    },
+  };
+  const maxAttempts = Math.max(
+    PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS,
+    ...Object.values(rules).map((rule) => rule.policy.maxAttempts),
+  );
+  return {
+    enabled,
+    maxAttempts: enabled ? maxAttempts : PROMPT_REINFORCER_RETRY_MIN_ATTEMPTS,
+    rules: enabled ? rules : {},
+  };
+}
+
+function getPromptReinforcerReasonRule(
+  settings: {
+    enabled: boolean;
+    rules: Partial<Record<PromptReinforcerOutputBlockReason, PromptReinforcerReasonRule>>;
+  },
+  reason: PromptReinforcerOutputBlockReason | undefined,
+): PromptReinforcerReasonRule | null {
+  if (!settings.enabled || !reason) {
+    return null;
+  }
+  return settings.rules[reason] ?? null;
 }
 
 function hasUnbackedReminderCommitment(text: string): boolean {
@@ -536,6 +645,7 @@ export async function runReplyAgent(params: {
     });
   const baseExtraSystemPrompt = followupRun.run.extraSystemPrompt;
   let lastGuardRetryReason: PromptReinforcerOutputBlockReason | undefined;
+  let lastGuardRetryMaxAttempts = promptReinforcerLoop.maxAttempts;
   let pendingAutoMemoryPrefetch: {
     promptBlock?: string;
     markUsedTool: boolean;
@@ -550,12 +660,17 @@ export async function runReplyAgent(params: {
         extraPromptParts.push(baseExtraSystemPrompt);
       }
       if (promptReinforcerLoop.enabled && lastGuardRetryReason) {
-        const retryInstruction = buildPromptReinforcerRetryInstruction({
-          reason: lastGuardRetryReason,
-          attempt,
-          maxAttempts: promptReinforcerLoop.maxAttempts,
-        });
-        extraPromptParts.push(retryInstruction);
+        const reasonRule = getPromptReinforcerReasonRule(
+          promptReinforcerLoop,
+          lastGuardRetryReason,
+        );
+        if (reasonRule) {
+          const retryInstruction = reasonRule.retryInstructionBuilder({
+            attempt,
+            maxAttempts: lastGuardRetryMaxAttempts,
+          });
+          extraPromptParts.push(retryInstruction);
+        }
       }
       if (autoMemoryPrefetchForAttempt?.promptBlock?.trim()) {
         extraPromptParts.push(autoMemoryPrefetchForAttempt.promptBlock.trim());
@@ -815,6 +930,7 @@ export async function runReplyAgent(params: {
       if (responseUsageLine) {
         finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
       }
+      const preGuardPayloads = finalPayloads.map((payload) => ({ ...payload }));
       logReplyRaw("attempt_output_pre_guard", {
         attempt,
         maxAttempts: promptReinforcerLoop.maxAttempts,
@@ -849,50 +965,71 @@ export async function runReplyAgent(params: {
         payloads: summarizeReplyPayloadsForRawLog(finalPayloads),
       });
 
-      if (
-        promptReinforcerLoop.enabled &&
-        guardResult.report.blocked &&
-        isRetryablePromptReinforcerReason(guardResult.report.reason) &&
-        attempt < promptReinforcerLoop.maxAttempts
-      ) {
-        if (guardResult.report.reason === "memory_search_required") {
-          const autoMemoryPrefetch = await runAutoMemoryPrefetch({
-            cfg,
-            agentId: followupRun.run.agentId || "main",
-            sessionKey,
-            query: followupRun.prompt,
-          });
-          logReplyRaw("memory_prefetch", {
-            attempt,
-            maxAttempts: promptReinforcerLoop.maxAttempts,
-            sessionKey: sessionKey ?? "unknown",
-            satisfied: autoMemoryPrefetch.satisfied,
-            reason: autoMemoryPrefetch.reason,
-            resultCount: autoMemoryPrefetch.resultCount,
-            error: autoMemoryPrefetch.error ?? null,
-          });
-          if (autoMemoryPrefetch.satisfied) {
-            pendingAutoMemoryPrefetch = {
-              promptBlock: autoMemoryPrefetch.promptBlock,
-              markUsedTool: true,
-            };
-          } else {
+      if (promptReinforcerLoop.enabled && guardResult.report.blocked) {
+        const reasonRule = getPromptReinforcerReasonRule(
+          promptReinforcerLoop,
+          guardResult.report.reason,
+        );
+        if (reasonRule) {
+          const retryPolicy = reasonRule.policy;
+          const reason = guardResult.report.reason;
+          if (attempt < retryPolicy.maxAttempts) {
+            if (reasonRule.mitigation === "auto_memory_prefetch") {
+              if (reason === "memory_search_required") {
+                const autoMemoryPrefetch = await runAutoMemoryPrefetch({
+                  cfg,
+                  agentId: followupRun.run.agentId || "main",
+                  sessionKey,
+                  query: followupRun.prompt,
+                });
+                logReplyRaw("memory_prefetch", {
+                  attempt,
+                  maxAttempts: retryPolicy.maxAttempts,
+                  sessionKey: sessionKey ?? "unknown",
+                  satisfied: autoMemoryPrefetch.satisfied,
+                  reason: autoMemoryPrefetch.reason,
+                  resultCount: autoMemoryPrefetch.resultCount,
+                  error: autoMemoryPrefetch.error ?? null,
+                });
+                if (autoMemoryPrefetch.satisfied) {
+                  pendingAutoMemoryPrefetch = {
+                    promptBlock: autoMemoryPrefetch.promptBlock,
+                    markUsedTool: true,
+                  };
+                } else {
+                  defaultRuntime.error(
+                    `[prompt-reinforcer] output guard retry prefetch failed: reason=memory_search_required prefetch=${autoMemoryPrefetch.reason} error=${autoMemoryPrefetch.error ?? "-"}`,
+                  );
+                }
+              }
+            }
+            lastGuardRetryReason = reason;
+            lastGuardRetryMaxAttempts = retryPolicy.maxAttempts;
             defaultRuntime.error(
-              `[prompt-reinforcer] output guard retry aborted: reason=memory_search_required prefetch=${autoMemoryPrefetch.reason} error=${autoMemoryPrefetch.error ?? "-"}`,
+              `[prompt-reinforcer] output guard retry: attempt=${attempt + 1}/${retryPolicy.maxAttempts} reason=${reason}`,
             );
+            continue;
+          }
+          if (retryPolicy.failOpen) {
+            defaultRuntime.error(
+              `[prompt-reinforcer] output guard fail-open: reason=${reason ?? "unknown"} attempts=${retryPolicy.maxAttempts}`,
+            );
+            logReplyRaw("attempt_output_fail_open", {
+              attempt,
+              maxAttempts: retryPolicy.maxAttempts,
+              sessionKey: sessionKey ?? "unknown",
+              reason: reason ?? null,
+              payloads: summarizeReplyPayloadsForRawLog(preGuardPayloads),
+            });
             lastGuardRetryReason = undefined;
+            lastGuardRetryMaxAttempts = promptReinforcerLoop.maxAttempts;
             return finalizeWithFollowup(
-              finalPayloads.length === 1 ? finalPayloads[0] : finalPayloads,
+              preGuardPayloads.length === 1 ? preGuardPayloads[0] : preGuardPayloads,
               queueKey,
               runFollowupTurn,
             );
           }
         }
-        lastGuardRetryReason = guardResult.report.reason;
-        defaultRuntime.error(
-          `[prompt-reinforcer] output guard retry: attempt=${attempt + 1}/${promptReinforcerLoop.maxAttempts} reason=${guardResult.report.reason}`,
-        );
-        continue;
       }
 
       // Post-compaction read audit (Layer 3)

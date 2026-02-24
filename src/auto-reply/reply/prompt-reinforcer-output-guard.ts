@@ -11,7 +11,9 @@ import {
 import { defaultRuntime } from "../../runtime.js";
 import type { ReplyPayload } from "../types.js";
 
-const DEFAULT_MAX_PASSES = 2;
+const DEFAULT_SOFT_MAX_PASSES = 3;
+const DEFAULT_HARD_MAX_PASSES = 10;
+const DEFAULT_MAX_PASSES = DEFAULT_SOFT_MAX_PASSES;
 const MIN_MAX_PASSES = 1;
 const MAX_MAX_PASSES = 10;
 const DEFAULT_TEMPERATURE = 0;
@@ -24,6 +26,8 @@ const FALLBACK_MEMORY_RECALL_REQUIRED_MESSAGE =
 const EXACT_ORIGINAL_TOKEN = "EXACT_ORIGINAL";
 const GUARD_SYSTEM_PROMPT =
   "You enforce policy strictly. Return exactly one JSON object and no extra text.";
+const HARD_CONSTRAINT_POLICY =
+  "Enforce hard constraints only. Resolve any logical contradiction with hard constraints while preserving the user's language and intent.";
 
 const MEMORY_RECALL_PATTERNS: RegExp[] = [
   /\b(previous|earlier|prior|last time|remember|recall)\b/i,
@@ -74,7 +78,11 @@ type PromptPolicyGuardRunner = (params: {
 
 type GuardSettings = {
   enabled: boolean;
-  maxPasses: number;
+  softMaxPasses: number;
+  hardMaxPasses: number;
+  softFailOpen: boolean;
+  hardFailClosed: boolean;
+  hardFailClosedMessage: string;
   failClosed: boolean;
   failClosedMessage: string;
   temperature: number;
@@ -84,6 +92,8 @@ type GuardSettings = {
 
 export type PromptReinforcerOutputBlockReason =
   | "memory_search_required"
+  | "soft_policy_blocked"
+  | "hard_constraints_blocked"
   | "policy_guard_blocked"
   | "guard_unavailable";
 
@@ -96,6 +106,17 @@ export type PromptReinforcerOutputReport = {
 export type PromptReinforcerOutputResult = {
   payloads: ReplyPayload[];
   report: PromptReinforcerOutputReport;
+};
+
+type GuardRuleStage = {
+  id: "soft_policy" | "hard_constraints";
+  phase: "soft" | "hard";
+  policy: string;
+  maxPasses: number;
+  hardConstraints: string[];
+  failOpen: boolean;
+  failClosedMessage: string;
+  blockReason: PromptReinforcerOutputBlockReason;
 };
 
 function isTextContentBlock(block: unknown): block is TextContent {
@@ -138,6 +159,10 @@ function resolveGuardSettings(raw: Record<string, unknown>): GuardSettings {
     typeof raw.enforceFailClosedMessage === "string" && raw.enforceFailClosedMessage.trim()
       ? raw.enforceFailClosedMessage.trim()
       : FALLBACK_FAIL_CLOSED_MESSAGE;
+  const hardFailClosedMessage =
+    typeof raw.enforceHardFailClosedMessage === "string" && raw.enforceHardFailClosedMessage.trim()
+      ? raw.enforceHardFailClosedMessage.trim()
+      : failClosedMessage;
   const memoryRecallFailMessage =
     typeof raw.enforceRequireMemorySearchMessage === "string" &&
     raw.enforceRequireMemorySearchMessage.trim()
@@ -145,12 +170,21 @@ function resolveGuardSettings(raw: Record<string, unknown>): GuardSettings {
       : FALLBACK_MEMORY_RECALL_REQUIRED_MESSAGE;
   return {
     enabled: raw.enforceOutput === true,
-    maxPasses: clampInteger(
-      raw.enforceMaxPasses,
-      DEFAULT_MAX_PASSES,
+    softMaxPasses: clampInteger(
+      raw.enforceSoftMaxPasses,
+      DEFAULT_SOFT_MAX_PASSES,
       MIN_MAX_PASSES,
       MAX_MAX_PASSES,
     ),
+    hardMaxPasses: clampInteger(
+      raw.enforceHardMaxPasses ?? raw.enforceMaxPasses,
+      DEFAULT_HARD_MAX_PASSES,
+      MIN_MAX_PASSES,
+      MAX_MAX_PASSES,
+    ),
+    softFailOpen: raw.enforceSoftFailOpen !== false,
+    hardFailClosed: raw.enforceHardFailClosed !== false,
+    hardFailClosedMessage,
     failClosed: raw.enforceFailClosed === true,
     failClosedMessage,
     temperature: clampNumber(
@@ -772,6 +806,39 @@ function normalizeToolNames(toolNames: string[] | undefined): string[] {
   return out;
 }
 
+function buildGuardRuleStages(params: {
+  policy: string;
+  settings: GuardSettings;
+  relevantHardConstraints: string[];
+}): GuardRuleStage[] {
+  const stages: GuardRuleStage[] = [];
+  if (params.policy) {
+    stages.push({
+      id: "soft_policy",
+      phase: "soft",
+      policy: params.policy,
+      maxPasses: params.settings.softMaxPasses,
+      hardConstraints: [],
+      failOpen: params.settings.softFailOpen,
+      failClosedMessage: params.settings.failClosedMessage,
+      blockReason: "soft_policy_blocked",
+    });
+  }
+  if (params.relevantHardConstraints.length > 0) {
+    stages.push({
+      id: "hard_constraints",
+      phase: "hard",
+      policy: HARD_CONSTRAINT_POLICY,
+      maxPasses: params.settings.hardMaxPasses,
+      hardConstraints: params.relevantHardConstraints,
+      failOpen: !params.settings.hardFailClosed,
+      failClosedMessage: params.settings.hardFailClosedMessage,
+      blockReason: "hard_constraints_blocked",
+    });
+  }
+  return stages;
+}
+
 function passOutput(payloads: ReplyPayload[]): PromptReinforcerOutputResult {
   return {
     payloads,
@@ -820,9 +887,6 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
     },
   });
   const policy = joinPromptPolicy(snippets);
-  if (!policy) {
-    return passOutput(params.payloads);
-  }
   const hardConstraintSource = resolveHardConstraintSource(raw);
   const hardSourceSnippets = hardConstraintSource
     ? await loadPromptSnippets({
@@ -835,12 +899,15 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
         },
       })
     : [];
-  const hardConstraintText = hardConstraintSource ? joinPromptPolicy(hardSourceSnippets) : policy;
+  const hardConstraintText = hardConstraintSource ? joinPromptPolicy(hardSourceSnippets) : "";
   const hardConstraints = extractHardConstraints(hardConstraintText, {
     allowPlainLines: hardConstraintSource != null,
   });
+  if (!policy && hardConstraints.length === 0) {
+    return passOutput(params.payloads);
+  }
   defaultRuntime.log(
-    `[prompt-reinforcer] output guard active: maxPasses=${settings.maxPasses} failClosed=${settings.failClosed ? 1 : 0} hardConstraints=${hardConstraints.length}`,
+    `[prompt-reinforcer] output guard active: softMaxPasses=${settings.softMaxPasses} softFailOpen=${settings.softFailOpen ? 1 : 0} hardMaxPasses=${settings.hardMaxPasses} hardFailClosed=${settings.hardFailClosed ? 1 : 0} hardConstraints=${hardConstraints.length}`,
   );
   if (hardConstraints.length > 0) {
     defaultRuntime.log(
@@ -914,6 +981,7 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
 
   const nextPayloads: ReplyPayload[] = [];
   let blockedByPolicy = false;
+  let blockedReason: PromptReinforcerOutputBlockReason | undefined;
   for (const [payloadIndex, payload] of params.payloads.entries()) {
     if (payload.isError || typeof payload.text !== "string" || payload.text.trim().length === 0) {
       logPromptReinforcerRaw("payload_skip", {
@@ -929,71 +997,103 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
       latestUserPrompt: params.latestUserPrompt,
       candidate: payload.text,
     });
+    const ruleStages = buildGuardRuleStages({
+      policy,
+      settings,
+      relevantHardConstraints,
+    });
     logPromptReinforcerRaw("payload_pre", {
       payload: payloadIndex + 1,
       text: payload.text,
       relevantHardConstraints,
+      rules: ruleStages.map((rule) => ({
+        id: rule.id,
+        maxPasses: rule.maxPasses,
+        failOpen: rule.failOpen,
+        blockReason: rule.blockReason,
+      })),
     });
     try {
-      const outcome = await enforcePromptPolicyText({
-        text: payload.text,
-        policy,
-        maxPasses: settings.maxPasses,
-        guardRunner,
-        hardConstraints: relevantHardConstraints,
-        onTrace: (trace) => {
-          defaultRuntime.log(
-            `[prompt-reinforcer] output guard pass: payload=${payloadIndex + 1} pass=${trace.pass} decision=${trace.decision} rewritten=${trace.rewritten ? 1 : 0} changed=${trace.rewrittenChanged ? 1 : 0} missing=${trace.hardMissing.length} contradictions=${trace.hardContradictions.length}`,
-          );
-          logPromptReinforcerRaw("pass", {
-            payload: payloadIndex + 1,
-            pass: trace.pass,
-            decision: trace.decision,
-            candidateBefore: trace.candidateBefore,
-            rewrittenText: trace.rewrittenText ?? "",
-            candidateAfter: trace.candidateAfter,
-            hardMissing: trace.hardMissing,
-            hardContradictions: trace.hardContradictions,
-          });
-          if (trace.hardMissing.length > 0 || trace.hardContradictions.length > 0) {
+      let currentText = payload.text;
+      let blockedPayload: ReplyPayload | null = null;
+      let payloadBlockReason: PromptReinforcerOutputBlockReason | undefined;
+
+      const runRuleStage = async (stage: GuardRuleStage) =>
+        enforcePromptPolicyText({
+          text: currentText,
+          policy: stage.policy,
+          maxPasses: stage.maxPasses,
+          guardRunner,
+          hardConstraints: stage.hardConstraints,
+          onTrace: (trace) => {
             defaultRuntime.log(
-              `[prompt-reinforcer] output guard pass details: payload=${payloadIndex + 1} pass=${trace.pass} missing=${summarizeConstraintList(trace.hardMissing)} contradictions=${summarizeConstraintList(trace.hardContradictions)}`,
+              `[prompt-reinforcer] output guard pass: payload=${payloadIndex + 1} rule=${stage.id} phase=${stage.phase} pass=${trace.pass} decision=${trace.decision} rewritten=${trace.rewritten ? 1 : 0} changed=${trace.rewrittenChanged ? 1 : 0} missing=${trace.hardMissing.length} contradictions=${trace.hardContradictions.length}`,
+            );
+            logPromptReinforcerRaw("pass", {
+              payload: payloadIndex + 1,
+              rule: stage.id,
+              phase: stage.phase,
+              pass: trace.pass,
+              decision: trace.decision,
+              candidateBefore: trace.candidateBefore,
+              rewrittenText: trace.rewrittenText ?? "",
+              candidateAfter: trace.candidateAfter,
+              hardMissing: trace.hardMissing,
+              hardContradictions: trace.hardContradictions,
+            });
+            if (trace.hardMissing.length > 0 || trace.hardContradictions.length > 0) {
+              defaultRuntime.log(
+                `[prompt-reinforcer] output guard pass details: payload=${payloadIndex + 1} rule=${stage.id} phase=${stage.phase} pass=${trace.pass} missing=${summarizeConstraintList(trace.hardMissing)} contradictions=${summarizeConstraintList(trace.hardContradictions)}`,
+              );
+            }
+          },
+        });
+
+      for (const stage of ruleStages) {
+        const stageOutcome = await runRuleStage(stage);
+        currentText = stageOutcome.text;
+        if (!stageOutcome.compliant) {
+          defaultRuntime.error(
+            `[prompt-reinforcer] output guard ${stage.id} unresolved: payload=${payloadIndex + 1} reason=${stageOutcome.reason} passes=${stageOutcome.passes} changed=${stageOutcome.changed ? 1 : 0} missing=${stageOutcome.hardMissing.length} contradictions=${stageOutcome.hardContradictions.length}`,
+          );
+          if (stageOutcome.hardMissing.length > 0 || stageOutcome.hardContradictions.length > 0) {
+            defaultRuntime.error(
+              `[prompt-reinforcer] output guard ${stage.id} details: payload=${payloadIndex + 1} missing=${summarizeConstraintList(stageOutcome.hardMissing)} contradictions=${summarizeConstraintList(stageOutcome.hardContradictions)}`,
             );
           }
-        },
-      });
-      if (outcome.compliant) {
-        defaultRuntime.log(
-          `[prompt-reinforcer] output guard result: payload=${payloadIndex + 1} status=pass reason=${outcome.reason} passes=${outcome.passes} changed=${outcome.changed ? 1 : 0}`,
-        );
+          if (!stage.failOpen) {
+            blockedPayload = withFailClosed(payload, stage.failClosedMessage);
+            payloadBlockReason = stage.blockReason;
+            break;
+          }
+        }
+      }
+
+      if (blockedPayload) {
         logPromptReinforcerRaw("payload_post", {
           payload: payloadIndex + 1,
-          status: "pass",
-          reason: outcome.reason,
-          text: outcome.text,
+          status: "blocked",
+          reason: payloadBlockReason ?? "policy_guard_blocked",
+          text: blockedPayload.text ?? "",
         });
-        nextPayloads.push({ ...payload, text: outcome.text });
+        nextPayloads.push(blockedPayload);
+        blockedByPolicy = true;
+        if (payloadBlockReason && !blockedReason) {
+          blockedReason = payloadBlockReason;
+        }
         continue;
       }
-      defaultRuntime.error(
-        `[prompt-reinforcer] output guard result: payload=${payloadIndex + 1} status=blocked reason=${outcome.reason} passes=${outcome.passes} changed=${outcome.changed ? 1 : 0} missing=${outcome.hardMissing.length} contradictions=${outcome.hardContradictions.length}`,
+
+      defaultRuntime.log(
+        `[prompt-reinforcer] output guard result: payload=${payloadIndex + 1} status=pass`,
       );
-      if (outcome.hardMissing.length > 0 || outcome.hardContradictions.length > 0) {
-        defaultRuntime.error(
-          `[prompt-reinforcer] output guard block details: payload=${payloadIndex + 1} missing=${summarizeConstraintList(outcome.hardMissing)} contradictions=${summarizeConstraintList(outcome.hardContradictions)}`,
-        );
-      }
-      const blockedPayload = settings.failClosed
-        ? withFailClosed(payload, settings.failClosedMessage)
-        : payload;
       logPromptReinforcerRaw("payload_post", {
         payload: payloadIndex + 1,
-        status: "blocked",
-        reason: outcome.reason,
-        text: blockedPayload.text ?? "",
+        status: "pass",
+        reason: "phase_pass",
+        text: currentText,
       });
-      nextPayloads.push(blockedPayload);
-      blockedByPolicy = blockedByPolicy || settings.failClosed;
+      nextPayloads.push({ ...payload, text: currentText });
     } catch (err) {
       defaultRuntime.error(
         `[prompt-reinforcer] output guard execution failed: payload=${payloadIndex + 1} ${String(err)}`,
@@ -1008,11 +1108,16 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
         text: failedPayload.text ?? "",
       });
       nextPayloads.push(failedPayload);
-      blockedByPolicy = blockedByPolicy || settings.failClosed;
+      if (settings.failClosed) {
+        blockedByPolicy = true;
+        if (!blockedReason) {
+          blockedReason = "policy_guard_blocked";
+        }
+      }
     }
   }
   return blockedByPolicy
-    ? blockedOutput(nextPayloads, "policy_guard_blocked", true)
+    ? blockedOutput(nextPayloads, blockedReason ?? "policy_guard_blocked", false)
     : passOutput(nextPayloads);
 }
 
