@@ -218,4 +218,56 @@ describe("prompt-reinforcer output guard", () => {
     });
     expect(payloads[0]?.text).toBe("策略冲突，已拦截。");
   });
+
+  it("blocks memory-recall queries when memory_search was not used", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-memory-gate-");
+    const cfg = createPromptReinforcerConfig({
+      enforceOutput: true,
+      enforceRequireMemorySearch: true,
+      lines: ["风格规则"],
+    });
+    let guardCalls = 0;
+    const payloads = await enforcePromptReinforcerOutput({
+      payloads: [{ text: "这是直接回答。" }],
+      cfg,
+      workspaceDir,
+      agentDir: workspaceDir,
+      provider: "openai-codex",
+      model: "gpt-5.3-codex",
+      latestUserPrompt: "我们之前做过什么决定？",
+      usedToolNames: [],
+      guardRunner: async () => {
+        guardCalls += 1;
+        return { compliant: true };
+      },
+    });
+    expect(guardCalls).toBe(0);
+    expect(payloads[0]?.text).toContain("Memory recall is required");
+  });
+
+  it("allows memory-recall queries after memory_search was used", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-memory-pass-");
+    const cfg = createPromptReinforcerConfig({
+      enforceOutput: true,
+      enforceRequireMemorySearch: true,
+      lines: ["风格规则"],
+    });
+    let guardCalls = 0;
+    const payloads = await enforcePromptReinforcerOutput({
+      payloads: [{ text: "回答完成。" }],
+      cfg,
+      workspaceDir,
+      agentDir: workspaceDir,
+      provider: "openai-codex",
+      model: "gpt-5.3-codex",
+      latestUserPrompt: "我之前的偏好是什么？",
+      usedToolNames: ["memory_search"],
+      guardRunner: async () => {
+        guardCalls += 1;
+        return { compliant: true };
+      },
+    });
+    expect(guardCalls).toBe(1);
+    expect(payloads[0]?.text).toBe("回答完成。");
+  });
 });

@@ -82,8 +82,8 @@ export function stripThoughtSignatures<T>(
   }) as T;
 }
 
-export const DEFAULT_BOOTSTRAP_MAX_CHARS = 20_000;
-export const DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS = 150_000;
+export const DEFAULT_BOOTSTRAP_MAX_CHARS = 40_000;
+export const DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS = 300_000;
 const MIN_BOOTSTRAP_FILE_BUDGET_CHARS = 64;
 const BOOTSTRAP_HEAD_RATIO = 0.7;
 const BOOTSTRAP_TAIL_RATIO = 0.2;

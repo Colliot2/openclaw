@@ -59,6 +59,8 @@ Use this when you want a persistent "prompt policy overlay" that is:
 - `enforceFailClosed` (boolean): default `false`. When `true`, block unresolved outputs with a fixed fallback message.
 - `enforceFailClosedMessage` (string): optional fallback message used when `enforceFailClosed=true`.
 - `enforceTemperature` (number): default `0`. Output-guard rewrite temperature (`0..1`).
+- `enforceRequireMemorySearch` (boolean): default `false`. When `true`, memory-recall questions are blocked unless `memory_search` was used in the same run.
+- `enforceRequireMemorySearchMessage` (string): optional override for the memory-recall block message.
 - `enforceHardFile` (string): optional hard-constraint file path (workspace-relative or absolute).
 - `enforceHardFiles` (string[]): optional hard-constraint file paths.
 - `enforceHardContent` (string): optional inline hard constraints.

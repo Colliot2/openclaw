@@ -1002,6 +1002,13 @@ export async function runEmbeddedPiAgent(
             suppressToolErrorWarnings: params.suppressToolErrorWarnings,
             inlineToolResultsAllowed: false,
           });
+          const usedTools = Array.from(
+            new Set(
+              attempt.toolMetas
+                .map((entry) => entry.toolName?.trim().toLowerCase())
+                .filter((name): name is string => Boolean(name)),
+            ),
+          );
 
           // Timeout aborts can leave the run without any assistant payloads.
           // Emit an explicit timeout error instead of silently completing, so
@@ -1021,6 +1028,7 @@ export async function runEmbeddedPiAgent(
                 agentMeta,
                 aborted,
                 systemPromptReport: attempt.systemPromptReport,
+                usedTools: usedTools.length > 0 ? usedTools : undefined,
               },
               didSendViaMessagingTool: attempt.didSendViaMessagingTool,
               messagingToolSentTexts: attempt.messagingToolSentTexts,
@@ -1053,6 +1061,7 @@ export async function runEmbeddedPiAgent(
               agentMeta,
               aborted,
               systemPromptReport: attempt.systemPromptReport,
+              usedTools: usedTools.length > 0 ? usedTools : undefined,
               // Handle client tool calls (OpenResponses hosted tools)
               stopReason: attempt.clientToolCall ? "tool_calls" : undefined,
               pendingToolCalls: attempt.clientToolCall

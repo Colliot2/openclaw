@@ -48,6 +48,35 @@ export function bm25RankToScore(rank: number): number {
   return 1 / (1 + normalized);
 }
 
+const MEMORY_ROOT_PATH_BOOST = 1.7;
+const MARKDOWN_PATH_BOOST = 1.3;
+
+function normalizePathForBoost(path: string): string {
+  return path.replaceAll("\\", "/").replace(/^\.\//, "").trim();
+}
+
+function isMemoryRootPath(normalizedPath: string): boolean {
+  const lower = normalizedPath.toLowerCase();
+  if (lower === "memory.md") {
+    return true;
+  }
+  return lower.endsWith("/memory.md");
+}
+
+export function resolvePathBoost(path: string): number {
+  const normalized = normalizePathForBoost(path);
+  if (!normalized) {
+    return 1;
+  }
+  if (isMemoryRootPath(normalized)) {
+    return MEMORY_ROOT_PATH_BOOST;
+  }
+  if (normalized.toLowerCase().endsWith(".md")) {
+    return MARKDOWN_PATH_BOOST;
+  }
+  return 1;
+}
+
 export async function mergeHybridResults(params: {
   vector: HybridVectorResult[];
   keyword: HybridKeywordResult[];
@@ -119,7 +148,8 @@ export async function mergeHybridResults(params: {
   }
 
   const merged = Array.from(byId.values()).map((entry) => {
-    const score = params.vectorWeight * entry.vectorScore + params.textWeight * entry.textScore;
+    const baseScore = params.vectorWeight * entry.vectorScore + params.textWeight * entry.textScore;
+    const score = baseScore * resolvePathBoost(entry.path);
     return {
       path: entry.path,
       startLine: entry.startLine,

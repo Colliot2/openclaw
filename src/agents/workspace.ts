@@ -411,6 +411,7 @@ async function resolveMemoryBootstrapEntries(
 
 export async function loadWorkspaceBootstrapFiles(dir: string): Promise<WorkspaceBootstrapFile[]> {
   const resolvedDir = resolveUserPath(dir);
+  const memoryEntries = await resolveMemoryBootstrapEntries(resolvedDir);
 
   const entries: Array<{
     name: WorkspaceBootstrapFileName;
@@ -420,6 +421,7 @@ export async function loadWorkspaceBootstrapFiles(dir: string): Promise<Workspac
       name: DEFAULT_AGENTS_FILENAME,
       filePath: path.join(resolvedDir, DEFAULT_AGENTS_FILENAME),
     },
+    ...memoryEntries,
     {
       name: DEFAULT_SOUL_FILENAME,
       filePath: path.join(resolvedDir, DEFAULT_SOUL_FILENAME),
@@ -445,8 +447,6 @@ export async function loadWorkspaceBootstrapFiles(dir: string): Promise<Workspac
       filePath: path.join(resolvedDir, DEFAULT_BOOTSTRAP_FILENAME),
     },
   ];
-
-  entries.push(...(await resolveMemoryBootstrapEntries(resolvedDir)));
 
   const result: WorkspaceBootstrapFile[] = [];
   for (const entry of entries) {

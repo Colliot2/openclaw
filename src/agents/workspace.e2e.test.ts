@@ -103,6 +103,27 @@ describe("ensureAgentWorkspace", () => {
 });
 
 describe("loadWorkspaceBootstrapFiles", () => {
+  it("prioritizes memory files right after AGENTS.md", async () => {
+    const tempDir = await makeTempWorkspace("openclaw-workspace-");
+    await writeWorkspaceFile({ dir: tempDir, name: DEFAULT_AGENTS_FILENAME, content: "agents" });
+    await writeWorkspaceFile({ dir: tempDir, name: DEFAULT_MEMORY_FILENAME, content: "memory" });
+    await writeWorkspaceFile({
+      dir: tempDir,
+      name: DEFAULT_BOOTSTRAP_FILENAME,
+      content: "bootstrap",
+    });
+
+    const files = await loadWorkspaceBootstrapFiles(tempDir);
+    const names = files.filter((file) => !file.missing).map((file) => file.name);
+    const agentsIndex = names.indexOf(DEFAULT_AGENTS_FILENAME);
+    const memoryIndex = names.indexOf(DEFAULT_MEMORY_FILENAME);
+    const bootstrapIndex = names.indexOf(DEFAULT_BOOTSTRAP_FILENAME);
+
+    expect(agentsIndex).toBeGreaterThanOrEqual(0);
+    expect(memoryIndex).toBeGreaterThan(agentsIndex);
+    expect(bootstrapIndex).toBeGreaterThan(memoryIndex);
+  });
+
   it("includes MEMORY.md when present", async () => {
     const tempDir = await makeTempWorkspace("openclaw-workspace-");
     await writeWorkspaceFile({ dir: tempDir, name: "MEMORY.md", content: "memory" });

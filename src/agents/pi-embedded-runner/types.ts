@@ -47,6 +47,8 @@ export type EmbeddedPiRunMeta = {
     name: string;
     arguments: string;
   }>;
+  /** Deduplicated tool names executed during this run. */
+  usedTools?: string[];
 };
 
 export type EmbeddedPiRunResult = {

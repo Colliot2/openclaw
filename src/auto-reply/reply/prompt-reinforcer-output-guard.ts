@@ -19,7 +19,18 @@ const MIN_TEMPERATURE = 0;
 const MAX_TEMPERATURE = 1;
 const FALLBACK_FAIL_CLOSED_MESSAGE =
   "I can't provide a compliant reply for the current prompt policy. Please clarify or retry.";
+const FALLBACK_MEMORY_RECALL_REQUIRED_MESSAGE =
+  "Memory recall is required for this request. Please retry after running memory_search first.";
 const EXACT_ORIGINAL_TOKEN = "EXACT_ORIGINAL";
+const GUARD_SYSTEM_PROMPT =
+  "You enforce policy strictly. Return exactly one JSON object and no extra text.";
+
+const MEMORY_RECALL_PATTERNS: RegExp[] = [
+  /\b(previous|earlier|prior|last time|remember|recall)\b/i,
+  /\b(decision|decisions|decided|preference|preferences|prefer|todo|to-do|task|tasks)\b/i,
+  /\b(history|historical|context|follow[-\s]?up|status update)\b/i,
+  /(之前|以前|上次|还记得|记不记得|回忆|回顾|历史|偏好|喜好|决策|决定|待办|任务|跟进|进展|约定|说过)/,
+];
 
 export type PromptPolicyGuardDecision = {
   compliant: boolean;
@@ -64,6 +75,8 @@ type GuardSettings = {
   failClosed: boolean;
   failClosedMessage: string;
   temperature: number;
+  requireMemorySearch: boolean;
+  memoryRecallFailMessage: string;
 };
 
 function isTextContentBlock(block: unknown): block is TextContent {
@@ -106,6 +119,11 @@ function resolveGuardSettings(raw: Record<string, unknown>): GuardSettings {
     typeof raw.enforceFailClosedMessage === "string" && raw.enforceFailClosedMessage.trim()
       ? raw.enforceFailClosedMessage.trim()
       : FALLBACK_FAIL_CLOSED_MESSAGE;
+  const memoryRecallFailMessage =
+    typeof raw.enforceRequireMemorySearchMessage === "string" &&
+    raw.enforceRequireMemorySearchMessage.trim()
+      ? raw.enforceRequireMemorySearchMessage.trim()
+      : FALLBACK_MEMORY_RECALL_REQUIRED_MESSAGE;
   return {
     enabled: raw.enforceOutput === true,
     maxPasses: clampInteger(
@@ -122,6 +140,8 @@ function resolveGuardSettings(raw: Record<string, unknown>): GuardSettings {
       MIN_TEMPERATURE,
       MAX_TEMPERATURE,
     ),
+    requireMemorySearch: raw.enforceRequireMemorySearch === true,
+    memoryRecallFailMessage,
   };
 }
 
@@ -517,9 +537,22 @@ async function createDefaultGuardRunner(params: {
   }
   return async ({ policy, candidate, hardConstraints }) => {
     const maxTokens = Math.min(2048, Math.max(256, Math.ceil(candidate.length * 1.5)));
+    const isOpenAICodex = resolved.model?.provider === "openai-codex";
+    const completionOptions: {
+      apiKey?: string;
+      temperature?: number;
+      maxTokens: number;
+    } = {
+      ...(apiKey ? { apiKey } : {}),
+      maxTokens,
+    };
+    if (!isOpenAICodex) {
+      completionOptions.temperature = temperature;
+    }
     const completion = await completeSimple(
       resolved.model!,
       {
+        systemPrompt: GUARD_SYSTEM_PROMPT,
         messages: [
           {
             role: "user",
@@ -528,17 +561,18 @@ async function createDefaultGuardRunner(params: {
           },
         ],
       },
-      {
-        ...(apiKey ? { apiKey } : {}),
-        temperature,
-        maxTokens,
-      },
+      completionOptions,
     );
+    if (completion.stopReason === "error") {
+      defaultRuntime.error(
+        `[prompt-reinforcer] output guard request failed: provider=${provider} model=${model} stopReason=error error=${summarizeErrorForLog(completion.errorMessage)}`,
+      );
+    }
     const text = collectCompletionText(completion.content);
     const decision = parseGuardDecision(text);
     if (!decision) {
       defaultRuntime.error(
-        `[prompt-reinforcer] output guard parse failed: provider=${provider} model=${model} raw=${summarizeTextForLog(text)}`,
+        `[prompt-reinforcer] output guard parse failed: provider=${provider} model=${model} stopReason=${completion.stopReason} error=${summarizeErrorForLog(completion.errorMessage)} raw=${summarizeTextForLog(text)}`,
       );
     }
     return decision;
@@ -572,6 +606,40 @@ function summarizeTextForLog(value: string, maxChars = 220): string {
   return `${compact.slice(0, maxChars)}...`;
 }
 
+function summarizeErrorForLog(value: unknown): string {
+  if (typeof value !== "string") {
+    return "<none>";
+  }
+  return summarizeTextForLog(value);
+}
+
+function requiresMemoryRecall(prompt?: string): boolean {
+  if (typeof prompt !== "string" || !prompt.trim()) {
+    return false;
+  }
+  return MEMORY_RECALL_PATTERNS.some((pattern) => pattern.test(prompt));
+}
+
+function normalizeToolNames(toolNames: string[] | undefined): string[] {
+  if (!Array.isArray(toolNames) || toolNames.length === 0) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const rawName of toolNames) {
+    if (typeof rawName !== "string") {
+      continue;
+    }
+    const normalized = rawName.trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
 export async function enforcePromptReinforcerOutput(params: {
   payloads: ReplyPayload[];
   cfg: OpenClawConfig;
@@ -580,6 +648,8 @@ export async function enforcePromptReinforcerOutput(params: {
   provider: string;
   model: string;
   authProfileId?: string;
+  latestUserPrompt?: string;
+  usedToolNames?: string[];
   guardRunner?: PromptPolicyGuardRunner;
 }): Promise<ReplyPayload[]> {
   const hookConfig = resolveHookConfig(params.cfg, PROMPT_REINFORCER_HOOK_KEY);
@@ -652,6 +722,19 @@ export async function enforcePromptReinforcerOutput(params: {
     return settings.failClosed
       ? params.payloads.map((payload) => withFailClosed(payload, settings.failClosedMessage))
       : params.payloads;
+  }
+
+  const usedTools = normalizeToolNames(params.usedToolNames);
+  const requiresRecall =
+    settings.requireMemorySearch && requiresMemoryRecall(params.latestUserPrompt);
+  const usedMemorySearch = usedTools.includes("memory_search");
+  if (requiresRecall && !usedMemorySearch) {
+    defaultRuntime.error(
+      `[prompt-reinforcer] output guard result: status=blocked reason=memory_search_required prompt=${summarizeTextForLog(params.latestUserPrompt ?? "")} usedTools=${usedTools.join(",") || "-"}`,
+    );
+    return params.payloads.map((payload) =>
+      withFailClosed(payload, settings.memoryRecallFailMessage),
+    );
   }
 
   const nextPayloads: ReplyPayload[] = [];

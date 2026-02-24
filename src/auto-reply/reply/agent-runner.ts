@@ -596,6 +596,8 @@ export async function runReplyAgent(params: {
       provider: providerUsed,
       model: modelUsed,
       authProfileId: followupRun.run.authProfileId,
+      latestUserPrompt: followupRun.prompt,
+      usedToolNames: runResult.meta?.usedTools,
     });
 
     // Post-compaction read audit (Layer 3)

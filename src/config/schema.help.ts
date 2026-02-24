@@ -161,9 +161,9 @@ export const FIELD_HELP: Record<string, string> = {
   "auth.cooldowns.billingMaxHours": "Cap (hours) for billing backoff (default: 24).",
   "auth.cooldowns.failureWindowHours": "Failure window (hours) for backoff counters (default: 24).",
   "agents.defaults.bootstrapMaxChars":
-    "Max characters of each workspace bootstrap file injected into the system prompt before truncation (default: 20000).",
+    "Max characters of each workspace bootstrap file injected into the system prompt before truncation (default: 40000).",
   "agents.defaults.bootstrapTotalMaxChars":
-    "Max total characters across all injected workspace bootstrap files (default: 150000).",
+    "Max total characters across all injected workspace bootstrap files (default: 300000).",
   "agents.defaults.repoRoot":
     "Optional repository root shown in the system prompt runtime line (overrides auto-detect).",
   "agents.defaults.envelopeTimezone":
