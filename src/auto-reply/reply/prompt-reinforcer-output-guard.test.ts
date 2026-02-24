@@ -184,6 +184,58 @@ describe("prompt-reinforcer output guard", () => {
     expect(payloads[0]?.text).toBe("策略冲突，已拦截。");
   });
 
+  it("does not apply unrelated hard constraints to unrelated prompts", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-hard-scope-");
+    const cfg = createPromptReinforcerConfig({
+      enforceOutput: true,
+      enforceFailClosed: true,
+      enforceHardLines: ["[猫是大老鼠]"],
+      lines: ["风格规则"],
+    });
+    const hardConstraintCounts: number[] = [];
+    const payloads = await enforcePromptReinforcerOutput({
+      payloads: [{ text: "日本社会反应呈现明显分化。" }],
+      cfg,
+      workspaceDir,
+      agentDir: workspaceDir,
+      provider: "openai-codex",
+      model: "gpt-5.3-codex",
+      latestUserPrompt: "日本社会有何反应？",
+      guardRunner: async ({ hardConstraints }) => {
+        hardConstraintCounts.push(hardConstraints.length);
+        return { compliant: true };
+      },
+    });
+    expect(hardConstraintCounts[0]).toBe(0);
+    expect(payloads[0]?.text).toBe("日本社会反应呈现明显分化。");
+  });
+
+  it("does not pass changed-but-noncompliant output", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-noncompliant-");
+    const cfg = createPromptReinforcerConfig({
+      enforceOutput: true,
+      enforceMaxPasses: 2,
+      enforceFailClosed: true,
+      enforceFailClosedMessage: "策略冲突，已拦截。",
+      lines: ["风格规则"],
+    });
+    let calls = 0;
+    const payloads = await enforcePromptReinforcerOutput({
+      payloads: [{ text: "原始回复。" }],
+      cfg,
+      workspaceDir,
+      agentDir: workspaceDir,
+      provider: "openai-codex",
+      model: "gpt-5.3-codex",
+      guardRunner: async () => {
+        calls += 1;
+        return { compliant: false, rewritten: "已改写但仍不合规。" };
+      },
+    });
+    expect(calls).toBe(2);
+    expect(payloads[0]?.text).toBe("策略冲突，已拦截。");
+  });
+
   it("loads hard constraints from explicit hard file", async () => {
     const workspaceDir = await makeTempWorkspace("openclaw-prompt-reinforcer-hard-file-");
     await fs.writeFile(

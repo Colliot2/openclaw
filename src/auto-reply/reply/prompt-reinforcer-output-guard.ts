@@ -624,6 +624,98 @@ function summarizeErrorForLog(value: unknown): string {
   return summarizeTextForLog(value);
 }
 
+function containsCjk(value: string): boolean {
+  return /[\u3400-\u9fff]/.test(value);
+}
+
+function extractConstraintAnchors(constraint: string): string[] {
+  const out: string[] = [];
+  const push = (raw: string | undefined) => {
+    if (!raw) {
+      return;
+    }
+    const normalized = raw.trim().replace(/^["'`[\](){}<>]+|["'`[\](){}<>]+$/g, "");
+    if (!normalized) {
+      return;
+    }
+    out.push(normalized);
+  };
+
+  const trimmed = constraint.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const cnMatch = trimmed.match(/^(.+?)是(.+)$/);
+  if (cnMatch?.[1] && cnMatch[2]) {
+    push(cnMatch[1]);
+    push(cnMatch[2]);
+  }
+
+  const enMatch = trimmed.match(/^(.+?)\bis\b(.+)$/i);
+  if (enMatch?.[1] && enMatch[2]) {
+    push(enMatch[1]);
+    push(enMatch[2]);
+  }
+
+  for (const segment of trimmed.split(/[，,。.!?;；:：\s]+/)) {
+    push(segment);
+  }
+
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const raw of out) {
+    const key = raw.toLowerCase();
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(raw);
+  }
+  return deduped;
+}
+
+function isHardConstraintRelevant(params: {
+  constraint: string;
+  latestUserPrompt?: string;
+  candidate: string;
+}): boolean {
+  const anchors = extractConstraintAnchors(params.constraint);
+  if (anchors.length === 0) {
+    return true;
+  }
+  const corpusRaw = `${params.latestUserPrompt ?? ""}\n${params.candidate}`;
+  const corpusCompact = normalizeCompactText(corpusRaw);
+  const corpusLower = corpusRaw.toLowerCase();
+  for (const anchor of anchors) {
+    if (containsCjk(anchor)) {
+      if (corpusCompact.includes(normalizeCompactText(anchor))) {
+        return true;
+      }
+      continue;
+    }
+    const escaped = escapeRegex(anchor.toLowerCase()).replace(/\s+/g, "\\s+");
+    if (new RegExp(`\\b${escaped}\\b`, "i").test(corpusLower)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function selectRelevantHardConstraints(params: {
+  hardConstraints: string[];
+  latestUserPrompt?: string;
+  candidate: string;
+}): string[] {
+  return params.hardConstraints.filter((constraint) =>
+    isHardConstraintRelevant({
+      constraint,
+      latestUserPrompt: params.latestUserPrompt,
+      candidate: params.candidate,
+    }),
+  );
+}
+
 function requiresMemoryRecall(prompt?: string): boolean {
   if (typeof prompt !== "string" || !prompt.trim()) {
     return false;
@@ -784,7 +876,11 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
         policy,
         maxPasses: settings.maxPasses,
         guardRunner,
-        hardConstraints,
+        hardConstraints: selectRelevantHardConstraints({
+          hardConstraints,
+          latestUserPrompt: params.latestUserPrompt,
+          candidate: payload.text,
+        }),
         onTrace: (trace) => {
           defaultRuntime.log(
             `[prompt-reinforcer] output guard pass: payload=${payloadIndex + 1} pass=${trace.pass} decision=${trace.decision} rewritten=${trace.rewritten ? 1 : 0} changed=${trace.rewrittenChanged ? 1 : 0} missing=${trace.hardMissing.length} contradictions=${trace.hardContradictions.length}`,
@@ -796,7 +892,7 @@ export async function enforcePromptReinforcerOutputWithReport(params: {
           }
         },
       });
-      if (outcome.compliant || outcome.changed) {
+      if (outcome.compliant) {
         defaultRuntime.log(
           `[prompt-reinforcer] output guard result: payload=${payloadIndex + 1} status=pass reason=${outcome.reason} passes=${outcome.passes} changed=${outcome.changed ? 1 : 0}`,
         );
