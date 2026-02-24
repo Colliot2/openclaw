@@ -61,6 +61,18 @@ function createSelectAllMultiselect() {
   return vi.fn(async (params) => params.options.map((option: { value: string }) => option.value));
 }
 
+function makeProviderModel(id: string, name: string) {
+  return {
+    id,
+    name,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200000,
+    maxTokens: 8192,
+  };
+}
+
 describe("promptDefaultModel", () => {
   it("supports configuring vLLM during onboarding", async () => {
     loadModelCatalog.mockResolvedValue([
@@ -260,8 +272,8 @@ describe("pruneKilocodeProviderModelsToAllowlist", () => {
             baseUrl: "https://api.kilo.ai/api/gateway/",
             api: "openai-completions",
             models: [
-              { id: "anthropic/claude-opus-4.6", name: "Claude Opus 4.6" },
-              { id: "minimax/minimax-m2.5:free", name: "MiniMax M2.5 (Free)" },
+              makeProviderModel("anthropic/claude-opus-4.6", "Claude Opus 4.6"),
+              makeProviderModel("minimax/minimax-m2.5:free", "MiniMax M2.5 (Free)"),
             ],
           },
         },
@@ -284,12 +296,12 @@ describe("pruneKilocodeProviderModelsToAllowlist", () => {
           kilocode: {
             baseUrl: "https://api.kilo.ai/api/gateway/",
             api: "openai-completions",
-            models: [{ id: "anthropic/claude-opus-4.6", name: "Claude Opus 4.6" }],
+            models: [makeProviderModel("anthropic/claude-opus-4.6", "Claude Opus 4.6")],
           },
           minimax: {
             baseUrl: "https://api.minimax.io/anthropic",
             api: "anthropic-messages",
-            models: [{ id: "MiniMax-M2.5", name: "MiniMax M2.5" }],
+            models: [makeProviderModel("MiniMax-M2.5", "MiniMax M2.5")],
           },
         },
       },
