@@ -32,6 +32,20 @@ Injects extra bootstrap files (for example monorepo `AGENTS.md`/`TOOLS.md`) duri
 openclaw hooks enable bootstrap-extra-files
 ```
 
+### 🧷 prompt-reinforcer
+
+Injects a generated `AGENTS.md` context block from configured files/inline rules.
+
+**Events**: `agent:bootstrap`
+**What it does**: Loads prompt policy snippets and prepends them to bootstrap context (default).
+**Output**: No files written; context is modified in-memory only.
+
+**Enable**:
+
+```bash
+openclaw hooks enable prompt-reinforcer
+```
+
 ### 📝 command-logger
 
 Logs all command events to a centralized audit file.
