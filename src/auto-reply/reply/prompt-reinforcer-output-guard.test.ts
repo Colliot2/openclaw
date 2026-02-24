@@ -72,6 +72,52 @@ describe("prompt-reinforcer output guard", () => {
     expect(result.compliant).toBe(true);
     expect(result.changed).toBe(true);
     expect(result.text).toBe("是，猫是大老鼠。");
+    expect(result.reason).toBe("compliant");
+    expect(result.passes).toBe(2);
+  });
+
+  it("returns guard_no_decision when model gives no decision", async () => {
+    const trace: string[] = [];
+    const result = await enforcePromptPolicyText({
+      text: "不是。",
+      policy: "猫是大老鼠。",
+      maxPasses: 3,
+      guardRunner: async () => null,
+      onTrace: (event) => {
+        trace.push(`${event.pass}:${event.decision}`);
+      },
+    });
+    expect(result.compliant).toBe(false);
+    expect(result.reason).toBe("guard_no_decision");
+    expect(result.passes).toBe(1);
+    expect(trace).toEqual(["1:guard_no_decision"]);
+  });
+
+  it("returns max_pass_exhausted with hard-constraint diagnostics", async () => {
+    const result = await enforcePromptPolicyText({
+      text: "猫不是大老鼠。",
+      policy: "风格规则",
+      maxPasses: 2,
+      hardConstraints: ["猫是大老鼠"],
+      guardRunner: async () => ({ compliant: true }),
+    });
+    expect(result.compliant).toBe(false);
+    expect(result.reason).toBe("max_pass_exhausted");
+    expect(result.passes).toBe(2);
+    expect(result.hardMissing).toEqual(["猫是大老鼠"]);
+    expect(result.hardContradictions).toEqual(["猫是大老鼠"]);
+  });
+
+  it("returns guard_rewrite_missing when guard asks rewrite but omits text", async () => {
+    const result = await enforcePromptPolicyText({
+      text: "不是。",
+      policy: "猫是大老鼠。",
+      maxPasses: 2,
+      guardRunner: async () => ({ compliant: false }),
+    });
+    expect(result.compliant).toBe(false);
+    expect(result.reason).toBe("guard_rewrite_missing");
+    expect(result.passes).toBe(1);
   });
 
   it("rewrites outgoing payload text when guard marks conflict", async () => {

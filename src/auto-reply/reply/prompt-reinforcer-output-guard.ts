@@ -26,6 +26,31 @@ export type PromptPolicyGuardDecision = {
   rewritten?: string;
 };
 
+export type PromptPolicyEnforceReason =
+  | "compliant"
+  | "guard_no_decision"
+  | "guard_rewrite_missing"
+  | "max_pass_exhausted";
+
+export type PromptPolicyEnforceTraceEvent = {
+  pass: number;
+  decision: "guard_no_decision" | "guard_compliant" | "guard_rewrite";
+  rewritten: boolean;
+  rewrittenChanged: boolean;
+  hardMissing: string[];
+  hardContradictions: string[];
+};
+
+export type PromptPolicyEnforceOutcome = {
+  text: string;
+  compliant: boolean;
+  changed: boolean;
+  reason: PromptPolicyEnforceReason;
+  passes: number;
+  hardMissing: string[];
+  hardContradictions: string[];
+};
+
 type PromptPolicyGuardRunner = (params: {
   policy: string;
   candidate: string;
@@ -308,7 +333,8 @@ export async function enforcePromptPolicyText(params: {
   maxPasses: number;
   guardRunner: PromptPolicyGuardRunner;
   hardConstraints?: string[];
-}): Promise<{ text: string; compliant: boolean; changed: boolean }> {
+  onTrace?: (event: PromptPolicyEnforceTraceEvent) => void;
+}): Promise<PromptPolicyEnforceOutcome> {
   let current = params.text;
   let changed = false;
   const hardConstraints = uniqueConstraints(params.hardConstraints ?? []);
@@ -326,17 +352,50 @@ export async function enforcePromptPolicyText(params: {
       hardConstraints,
     });
     if (!decision) {
-      return { text: current, compliant: false, changed };
+      params.onTrace?.({
+        pass,
+        decision: "guard_no_decision",
+        rewritten: false,
+        rewrittenChanged: false,
+        hardMissing: [],
+        hardContradictions: [],
+      });
+      return {
+        text: current,
+        compliant: false,
+        changed,
+        reason: "guard_no_decision",
+        passes: pass,
+        hardMissing: [],
+        hardContradictions: [],
+      };
     }
     if (decision.compliant) {
       const hardCheck = evaluateHardConstraints({
         candidate: current,
         hardConstraints,
       });
-      if (hardCheck.compliant) {
-        return { text: current, compliant: true, changed };
-      }
       const rewritten = decision.rewritten?.trim();
+      const rewrittenChanged = Boolean(rewritten && rewritten !== current);
+      params.onTrace?.({
+        pass,
+        decision: "guard_compliant",
+        rewritten: Boolean(rewritten),
+        rewrittenChanged,
+        hardMissing: hardCheck.missing,
+        hardContradictions: hardCheck.contradictions,
+      });
+      if (hardCheck.compliant) {
+        return {
+          text: current,
+          compliant: true,
+          changed,
+          reason: "compliant",
+          passes: pass,
+          hardMissing: [],
+          hardContradictions: [],
+        };
+      }
       if (rewritten && rewritten !== current) {
         current = rewritten;
         changed = true;
@@ -344,15 +403,48 @@ export async function enforcePromptPolicyText(params: {
       continue;
     }
     const rewritten = decision.rewritten?.trim();
+    const rewrittenChanged = Boolean(rewritten && rewritten !== current);
+    params.onTrace?.({
+      pass,
+      decision: "guard_rewrite",
+      rewritten: Boolean(rewritten),
+      rewrittenChanged,
+      hardMissing: [],
+      hardContradictions: [],
+    });
     if (!rewritten) {
-      return { text: current, compliant: false, changed };
+      const hardCheck = evaluateHardConstraints({
+        candidate: current,
+        hardConstraints,
+      });
+      return {
+        text: current,
+        compliant: false,
+        changed,
+        reason: "guard_rewrite_missing",
+        passes: pass,
+        hardMissing: hardCheck.missing,
+        hardContradictions: hardCheck.contradictions,
+      };
     }
-    if (rewritten !== current) {
+    if (rewritten && rewritten !== current) {
       current = rewritten;
       changed = true;
     }
   }
-  return { text: current, compliant: false, changed };
+  const hardCheck = evaluateHardConstraints({
+    candidate: current,
+    hardConstraints,
+  });
+  return {
+    text: current,
+    compliant: false,
+    changed,
+    reason: "max_pass_exhausted",
+    passes: maxPasses,
+    hardMissing: hardCheck.missing,
+    hardContradictions: hardCheck.contradictions,
+  };
 }
 
 function buildGuardPrompt(params: {
@@ -443,7 +535,13 @@ async function createDefaultGuardRunner(params: {
       },
     );
     const text = collectCompletionText(completion.content);
-    return parseGuardDecision(text);
+    const decision = parseGuardDecision(text);
+    if (!decision) {
+      defaultRuntime.error(
+        `[prompt-reinforcer] output guard parse failed: provider=${provider} model=${model} raw=${summarizeTextForLog(text)}`,
+      );
+    }
+    return decision;
   };
 }
 
@@ -452,6 +550,26 @@ function withFailClosed(payload: ReplyPayload, message: string): ReplyPayload {
     return payload;
   }
   return { ...payload, text: message };
+}
+
+function summarizeConstraintList(values: string[], previewCount = 2): string {
+  if (values.length === 0) {
+    return "-";
+  }
+  const shown = values.slice(0, previewCount).join(" | ");
+  const rest = values.length - previewCount;
+  return rest > 0 ? `${shown} (+${rest} more)` : shown;
+}
+
+function summarizeTextForLog(value: string, maxChars = 220): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return "<empty>";
+  }
+  if (compact.length <= maxChars) {
+    return compact;
+  }
+  return `${compact.slice(0, maxChars)}...`;
 }
 
 export async function enforcePromptReinforcerOutput(params: {
@@ -501,6 +619,14 @@ export async function enforcePromptReinforcerOutput(params: {
   const hardConstraints = extractHardConstraints(hardConstraintText, {
     allowPlainLines: hardConstraintSource != null,
   });
+  defaultRuntime.log(
+    `[prompt-reinforcer] output guard active: maxPasses=${settings.maxPasses} failClosed=${settings.failClosed ? 1 : 0} hardConstraints=${hardConstraints.length}`,
+  );
+  if (hardConstraints.length > 0) {
+    defaultRuntime.log(
+      `[prompt-reinforcer] output guard hard constraints: ${summarizeConstraintList(hardConstraints)}`,
+    );
+  }
 
   let guardRunner: PromptPolicyGuardRunner | null | undefined = params.guardRunner;
   if (!guardRunner) {
@@ -520,13 +646,16 @@ export async function enforcePromptReinforcerOutput(params: {
   }
 
   if (!guardRunner) {
+    defaultRuntime.error(
+      `[prompt-reinforcer] output guard unavailable: failClosed=${settings.failClosed ? 1 : 0}`,
+    );
     return settings.failClosed
       ? params.payloads.map((payload) => withFailClosed(payload, settings.failClosedMessage))
       : params.payloads;
   }
 
   const nextPayloads: ReplyPayload[] = [];
-  for (const payload of params.payloads) {
+  for (const [payloadIndex, payload] of params.payloads.entries()) {
     if (payload.isError || typeof payload.text !== "string" || payload.text.trim().length === 0) {
       nextPayloads.push(payload);
       continue;
@@ -538,16 +667,39 @@ export async function enforcePromptReinforcerOutput(params: {
         maxPasses: settings.maxPasses,
         guardRunner,
         hardConstraints,
+        onTrace: (trace) => {
+          defaultRuntime.log(
+            `[prompt-reinforcer] output guard pass: payload=${payloadIndex + 1} pass=${trace.pass} decision=${trace.decision} rewritten=${trace.rewritten ? 1 : 0} changed=${trace.rewrittenChanged ? 1 : 0} missing=${trace.hardMissing.length} contradictions=${trace.hardContradictions.length}`,
+          );
+          if (trace.hardMissing.length > 0 || trace.hardContradictions.length > 0) {
+            defaultRuntime.log(
+              `[prompt-reinforcer] output guard pass details: payload=${payloadIndex + 1} pass=${trace.pass} missing=${summarizeConstraintList(trace.hardMissing)} contradictions=${summarizeConstraintList(trace.hardContradictions)}`,
+            );
+          }
+        },
       });
       if (outcome.compliant || outcome.changed) {
+        defaultRuntime.log(
+          `[prompt-reinforcer] output guard result: payload=${payloadIndex + 1} status=pass reason=${outcome.reason} passes=${outcome.passes} changed=${outcome.changed ? 1 : 0}`,
+        );
         nextPayloads.push({ ...payload, text: outcome.text });
         continue;
+      }
+      defaultRuntime.error(
+        `[prompt-reinforcer] output guard result: payload=${payloadIndex + 1} status=blocked reason=${outcome.reason} passes=${outcome.passes} changed=${outcome.changed ? 1 : 0} missing=${outcome.hardMissing.length} contradictions=${outcome.hardContradictions.length}`,
+      );
+      if (outcome.hardMissing.length > 0 || outcome.hardContradictions.length > 0) {
+        defaultRuntime.error(
+          `[prompt-reinforcer] output guard block details: payload=${payloadIndex + 1} missing=${summarizeConstraintList(outcome.hardMissing)} contradictions=${summarizeConstraintList(outcome.hardContradictions)}`,
+        );
       }
       nextPayloads.push(
         settings.failClosed ? withFailClosed(payload, settings.failClosedMessage) : payload,
       );
     } catch (err) {
-      defaultRuntime.error(`[prompt-reinforcer] output guard execution failed: ${String(err)}`);
+      defaultRuntime.error(
+        `[prompt-reinforcer] output guard execution failed: payload=${payloadIndex + 1} ${String(err)}`,
+      );
       nextPayloads.push(
         settings.failClosed ? withFailClosed(payload, settings.failClosedMessage) : payload,
       );
