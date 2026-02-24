@@ -37,7 +37,7 @@ openclaw hooks enable bootstrap-extra-files
 Injects a generated `AGENTS.md` context block from configured files/inline rules.
 
 **Events**: `agent:bootstrap`
-**What it does**: Loads prompt policy snippets and prepends them to bootstrap context (default).
+**What it does**: Loads prompt policy snippets, prepends them to bootstrap context (default), and can optionally rewrite final replies to enforce policy.
 **Output**: No files written; context is modified in-memory only.
 
 **Enable**:

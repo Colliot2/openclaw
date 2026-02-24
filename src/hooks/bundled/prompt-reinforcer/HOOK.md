@@ -54,5 +54,10 @@ Use this when you want a persistent "prompt policy overlay" that is:
 - `content` (string): inline prompt snippet.
 - `lines` (string[]): inline prompt lines.
 - `prepend` (boolean): default `true`. When `false`, appends instead of prepending.
+- `enforceOutput` (boolean): default `false`. When `true`, run a final output guard before sending text replies.
+- `enforceMaxPasses` (number): default `2` (clamped `1..3`). Max rewrite attempts in output guard.
+- `enforceFailClosed` (boolean): default `false`. When `true`, block unresolved outputs with a fixed fallback message.
+- `enforceFailClosedMessage` (string): optional fallback message used when `enforceFailClosed=true`.
+- `enforceTemperature` (number): default `0`. Output-guard rewrite temperature (`0..1`).
 
 If both file-based and inline values are provided, all snippets are concatenated.

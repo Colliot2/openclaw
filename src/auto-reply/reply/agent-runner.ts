@@ -43,6 +43,7 @@ import {
   readSessionMessages,
 } from "./post-compaction-audit.js";
 import { readPostCompactionContext } from "./post-compaction-context.js";
+import { enforcePromptReinforcerOutput } from "./prompt-reinforcer-output-guard.js";
 import { enqueueFollowupRun, type FollowupRun, type QueueSettings } from "./queue.js";
 import { createReplyToModeFilterForChannel, resolveReplyToMode } from "./reply-threading.js";
 import { incrementRunCompactionCount, persistRunSessionUsage } from "./session-run-accounting.js";
@@ -587,6 +588,15 @@ export async function runReplyAgent(params: {
     if (responseUsageLine) {
       finalPayloads = appendUsageLine(finalPayloads, responseUsageLine);
     }
+    finalPayloads = await enforcePromptReinforcerOutput({
+      payloads: finalPayloads,
+      cfg,
+      workspaceDir: followupRun.run.workspaceDir,
+      agentDir: followupRun.run.agentDir,
+      provider: providerUsed,
+      model: modelUsed,
+      authProfileId: followupRun.run.authProfileId,
+    });
 
     // Post-compaction read audit (Layer 3)
     if (sessionKey && pendingPostCompactionAudits.get(sessionKey)) {
